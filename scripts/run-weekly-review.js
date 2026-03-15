@@ -103,44 +103,76 @@ async function getCalendarEvents(accessToken) {
   return events;
 }
 
-// --- Gmail: 送信メール・未返信確認 ---
+// --- Gmail: 受信・送信・未返信を総合的にチェック ---
 async function getGmailData(accessToken) {
-  // 過去14日間の送信メール
   const twoWeeksAgo = Math.floor((Date.now() - 14 * 86400 * 1000) / 1000);
-  const query = `in:sent after:${twoWeeksAgo}`;
-  const params = new URLSearchParams({ q: query, maxResults: '30' });
 
-  const listRes = await httpRequest(
-    `https://www.googleapis.com/gmail/v1/users/me/messages?${params}`,
+  // まずGmail APIの疎通テスト
+  const profileRes = await httpRequest(
+    'https://www.googleapis.com/gmail/v1/users/me/profile',
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  console.log('Gmail profile:', JSON.stringify(profileRes.data));
+  if (profileRes.status !== 200) {
+    console.error('❌ Gmail API アクセス失敗 (status ' + profileRes.status + '):', JSON.stringify(profileRes.data));
+    return { inbox: [], sent: [], unreplied: [] };
+  }
+  console.log(`✅ Gmail: ${profileRes.data.emailAddress} に接続`);
+
+  // --- 受信メール（未読・要対応）---
+  const inboxQuery = `in:inbox is:unread after:${twoWeeksAgo}`;
+  const inboxRes = await httpRequest(
+    `https://www.googleapis.com/gmail/v1/users/me/messages?${new URLSearchParams({ q: inboxQuery, maxResults: '20' })}`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
 
-  if (listRes.status !== 200 || !listRes.data.messages) {
-    console.log('Gmail: 送信メールなし or エラー');
-    return { sent: [], unreplied: [] };
-  }
-
-  const sentEmails = [];
-  // 最新15件の詳細を取得
-  const messageIds = listRes.data.messages.slice(0, 15);
-
-  for (const msg of messageIds) {
-    const detailRes = await httpRequest(
-      `https://www.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata&metadataHeaders=Subject&metadataHeaders=To&metadataHeaders=Date`,
-      { headers: { Authorization: `Bearer ${accessToken}` } }
-    );
-    if (detailRes.status === 200) {
-      const headers = detailRes.data.payload?.headers || [];
-      sentEmails.push({
-        subject: headers.find((h) => h.name === 'Subject')?.value || '(件名なし)',
-        to: headers.find((h) => h.name === 'To')?.value || '',
-        date: headers.find((h) => h.name === 'Date')?.value || '',
-        threadId: detailRes.data.threadId,
-      });
+  const inboxEmails = [];
+  if (inboxRes.status === 200 && inboxRes.data.messages) {
+    for (const msg of inboxRes.data.messages.slice(0, 10)) {
+      const detail = await httpRequest(
+        `https://www.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      if (detail.status === 200) {
+        const headers = detail.data.payload?.headers || [];
+        inboxEmails.push({
+          subject: headers.find((h) => h.name === 'Subject')?.value || '(件名なし)',
+          from: headers.find((h) => h.name === 'From')?.value || '',
+          date: headers.find((h) => h.name === 'Date')?.value || '',
+        });
+      }
     }
   }
+  console.log(`✅ Gmail受信（未読）: ${inboxEmails.length}件`);
 
-  // 各スレッドの返信チェック（送ったが返信がないもの）
+  // --- 送信メール ---
+  const sentQuery = `in:sent after:${twoWeeksAgo}`;
+  const sentRes = await httpRequest(
+    `https://www.googleapis.com/gmail/v1/users/me/messages?${new URLSearchParams({ q: sentQuery, maxResults: '20' })}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+
+  const sentEmails = [];
+  if (sentRes.status === 200 && sentRes.data.messages) {
+    for (const msg of sentRes.data.messages.slice(0, 10)) {
+      const detail = await httpRequest(
+        `https://www.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata&metadataHeaders=Subject&metadataHeaders=To&metadataHeaders=Date`,
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      if (detail.status === 200) {
+        const headers = detail.data.payload?.headers || [];
+        sentEmails.push({
+          subject: headers.find((h) => h.name === 'Subject')?.value || '(件名なし)',
+          to: headers.find((h) => h.name === 'To')?.value || '',
+          date: headers.find((h) => h.name === 'Date')?.value || '',
+          threadId: detail.data.threadId,
+        });
+      }
+    }
+  }
+  console.log(`✅ Gmail送信: ${sentEmails.length}件`);
+
+  // --- 未返信チェック（送ったが返信なし）---
   const unreplied = [];
   for (const email of sentEmails) {
     const threadRes = await httpRequest(
@@ -149,17 +181,15 @@ async function getGmailData(accessToken) {
     );
     if (threadRes.status === 200) {
       const messages = threadRes.data.messages || [];
-      const lastMsg = messages[messages.length - 1];
-      const lastFrom = (lastMsg?.payload?.headers || []).find((h) => h.name === 'From')?.value || '';
-      // 最後のメッセージが自分からの送信（＝返信がまだない）
-      if (lastFrom.includes(GOOGLE_CLIENT_ID) === false && messages.length === 1) {
+      // スレッドに1通しかない = 自分が送っただけで返信なし
+      if (messages.length === 1) {
         unreplied.push(email);
       }
     }
   }
+  console.log(`✅ Gmail未返信候補: ${unreplied.length}件`);
 
-  console.log(`✅ Gmail: 送信${sentEmails.length}件, 未返信候補${unreplied.length}件`);
-  return { sent: sentEmails, unreplied };
+  return { inbox: inboxEmails, sent: sentEmails, unreplied };
 }
 
 // --- Notion: データベースから取得 ---
@@ -243,9 +273,10 @@ async function generateSummary(calendarEvents, gmailData, notionData) {
 ## Google Calendarの予定
 ${JSON.stringify(calendarEvents, null, 2)}
 
-## Gmailの送信メール（過去14日間）
+## Gmail（過去14日間）
+未読の受信メール: ${JSON.stringify(gmailData.inbox, null, 2)}
 送信メール: ${JSON.stringify(gmailData.sent, null, 2)}
-未返信候補: ${JSON.stringify(gmailData.unreplied, null, 2)}
+送信したが返信がないメール: ${JSON.stringify(gmailData.unreplied, null, 2)}
 
 ## Notionのデータ
 データベース一覧: ${JSON.stringify(notionData.databases)}
@@ -265,6 +296,9 @@ ${JSON.stringify(calendarEvents, null, 2)}
 📧 **フォローアップが必要なメール**
 - 送ったが返信がないメール（相手名・件名・送信日）
 - 二通目を送るべきメール
+
+📬 **未読の重要メール（要対応）**
+- 受信したが未読・未対応のメールで重要なもの
 
 ⚠️ **注意事項・リスク**
 - 期限が近いタスク
