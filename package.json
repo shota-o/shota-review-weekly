@@ -1,7 +1,7 @@
 {
-  "name": "shota-weekly",
-  "version": "1.0.0",
-  "description": "週次レビュー自動化（Notion + Gmail + Calendar → Slack）",
+  "name": "shota-weekly-review",
+  "version": "3.0.0",
+  "description": "マルチステージ週次レビュー自動化（Gmail + Calendar + Notion → Claude → Slack）",
   "private": true,
   "scripts": {
     "review": "node scripts/run-weekly-review.js"
