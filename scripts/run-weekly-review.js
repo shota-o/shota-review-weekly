@@ -449,14 +449,17 @@ async function synthesize(gmail, calendar, notion, slack) {
   const sys = `あなたは株式会社Mavericks 代表取締役 奥野翔太の右腕です。
 トーン：明るく、テンポよく。大袈裟にしない。フレンドリーだけど中身はしっかり。
 
-Slack投稿の書式ルール（厳守）：
-- *太字*（アスタリスクで囲む）は使わない。
-- ## や # は使わない。Slackではただの記号になる。
-- セクション見出しは「絵文字 + テキスト」だけ。例：☀️ 今週おつかれさまでした
-- サブ見出しは「→」で始める。
-- 箇条書きは「• 」を使う。
-- セクション間は空行1つで区切る。
-- シンプルに、すっきり。装飾より読みやすさ。
+Slack mrkdwn 書式ルール（厳守）：
+- *アスタリスク太字* は使わない。**ダブル**も禁止。## # も禁止。
+- セクション見出しは絵文字+テキストだけ。
+- 絵文字は基本的なものだけ使う（文字化け防止）。OK: :sunny: :calendar: :email: :speech_balloon: :chart_with_upwards_trend: :wrench: :bulb: :clock3:
+  NG: 合字絵文字、旗絵文字、肌色バリアントなど複雑な絵文字
+- 視認性のために以下を積極的に使う：
+  • \`バッククォート\` でキーワード（会社名、件名等）を囲む → コード表示になって目立つ
+  • > で始まる行は引用ブロックになる。補足説明はこれで書く
+  • \`\`\` で囲むとコードブロックになる。複数行の整理された情報に使う
+- 箇条書きは「• 」で始める。
+- 1件あたり1-2行で簡潔に。情報を分解して行数を増やさず、自然な文章でまとめる。
 
 中身のルール：
 - 「他X件」「等」のような省略は絶対禁止。全件書く。
@@ -498,86 +501,110 @@ Slack投稿の書式ルール（厳守）：
   const nextWeekLabel = `${fmt(nextMonday)}〜${fmt(nextFriday)}`;
 
   console.log('  セクション1: 振り返り + 来週');
-  const sec1 = await callClaude(sys, `${input}\n\n以下を出力。*太字*禁止、#禁止。絵文字+テキストで見出し。
+  const sec1 = await callClaude(sys, `${input}\n\n以下を出力。
 
-☀️ 今週の振り返り（${thisWeekLabel}）
+:sunny: 今週の振り返り（${thisWeekLabel}）
 
-曜日ごとに、実際にやったことを簡潔にまとめる。カレンダーの転記ではなく「何があって、どうなったか」を書く。
+曜日ごとに「何があって、どうなったか」を簡潔にまとめる。
+会社名は \`バッククォート\` で囲んで目立たせる。背景や補足は > 引用ブロックで書く。
 
-出力フォーマット例：
+出力フォーマット（この通りに書くこと）：
 月 3/10
-• PwCと○○の件で打合せ → △△の方向で合意
-• アステラス製薬にNoLang紹介 → 関心高め、次回デモ設定の流れ
+• \`PwC\` と○○の件で打合せ → 方向性で合意
+• \`アステラス製薬\` にNoLang紹介
+> 関心高め。先方は△△部門での活用を検討中。次回デモ設定の流れ
 
 火 3/11
-• BEMAC対面 → □□について議論。宿題は××
-...
+• \`BEMAC\` 対面 → □□について議論
+> 宿題: ××の資料を次回までに準備
 
-各日2-4行で十分。何もなかった日は飛ばしてOK。
+各日2-4行。何もなかった日は飛ばす。
 ポイントは「何が進んだか」「何が決まったか」「宿題は何か」。
 
-📅 来週やること整理（${nextWeekLabel}）
+:calendar: 来週やること整理（${nextWeekLabel}）
 
-こちらも曜日ごとに整理。ただしカレンダーのコピーではなく、「その日の勘所」を書く。
+曜日ごとに「その日の勘所」を整理。カレンダーのコピーではなく分析。
 
-出力フォーマット例：
+出力フォーマット（この通りに書くこと）：
 月 3/17
-• 重要: BEMAC+PwCの対面 → 前回の宿題を持っていく。資料は日曜中に確認
-• 川口市 齋藤様は初回 → 自治体向け資料を準備
-• ⏰ PR TIMESの修正版は今日中に送る必要あり
+• \`BEMAC + PwC\` 対面
+> 前回の宿題を持っていく。資料は日曜中に確認しておくこと
+• \`川口市\` 斎藤様（初回）
+> 自治体DXの文脈。先方はAI活用に前向きとの情報あり。自治体向け資料を準備
+• :clock3: \`PR TIMES\` 修正版は今日中に送る必要あり
 
 火 3/18
-• デンソーとレスターが時間被り → デンソーを優先してレスターはリスケ提案
-...
+• \`デンソー\` と \`レスター\` が時間被り → デンソー優先でレスターはリスケ提案
 
 各日のポイント：
 - その日で一番大事なことは何か
-- 準備が必要なことと、その背景
-- デッドラインがあるもの
+- 準備が必要なことと、その背景（ > 引用ブロックで補足）
+- デッドラインがあるもの（ :clock3: マーク）
 - 重複があれば、どちらを優先すべきか`, 8000);
   sections.push(sec1);
 
   console.log('  セクション2: メール');
-  const sec2 = await callClaude(sys, `${input}\n\n以下を出力。「他X件」省略は絶対禁止。全件書くこと。*太字*禁止、#禁止。
+  const sec2 = await callClaude(sys, `${input}\n\n以下を出力。「他X件」省略は絶対禁止。全件書くこと。
 未読か既読かは関係ない。重要かどうかで判断。
+各メールの情報は1-2行の自然な文章にまとめる。冗長に書かない。
+件名は \`バッククォート\` で囲む。補足は > 引用ブロックで書く。
 
-📧 メールまわりの整理
+:email: メールまわりの整理
 
 → 注目しておくべきメール
-今週のメールで重要なものをピックアップ。
-各メールに、なぜ重要か・現在のステータス・ネクストアクションを添えて。
-例：「○○社の△△さんから見積依頼 → □□の資料を添えて返信するとよい」
+
+出力フォーマット（この通りに書くこと）：
+• \`見積依頼の件\` ← ○○社 △△さん（3/12）
+> 導入検討中で□□プランの見積を求められている。資料を添えて今週中に返信
+
+• \`提携の方向性について\` ← ××社 ▽▽さん（3/13）
+> 具体的な条件提示あり。来週の打合せ前に社内で方針を固めておく
 
 → 返信が来ていない相手
-こちらから送ったが返信がない相手を全件。
-相手名・件名・送信日・背景（何の件か）・いつ頃フォローするかの提案。
+
+出力フォーマット（この通りに書くこと）：
+• \`NoLangサービス紹介\` → ○○市 △△様（送信 3/10）
+> 自治体DX提案の初回メール。1週間経過、水曜あたりにフォロー
 
 → もう一度連絡した方がいい相手
-そろそろ再コンタクトすべき相手を全件。理由と推奨アクション付き。`, 8000);
+
+出力フォーマット（この通りに書くこと）：
+• ○○社 △△さん
+> 前回から2週間経過。先方が検討中だった□□の件、進捗確認のメールを`, 8000);
   sections.push(sec2);
 
   console.log('  セクション3: Slack + 商談 + 開発 + ひとこと');
-  const sec3 = await callClaude(sys, `${input}\n\n以下を出力。*太字*禁止、#禁止。
+  const sec3 = await callClaude(sys, `${input}\n\n以下を出力。
+トピック名は \`バッククォート\` で囲む。補足は > 引用ブロックで書く。
 
-💬 Slackから拾っておくこと
+:speech_balloon: Slackから拾っておくこと
 
 翔太が見落としていそうなもの・覚えておくべきことを幅広く拾う。
-• 重要な情報共有・決定事項
-• 誰かの相談や提案で、翔太がリアクションした方がよさそうなもの
-• 技術的トピックやプロダクトに影響する話題
-• チームの動きやモチベーションに関わること
 
-📊 商談の状況
+出力フォーマット（この通りに書くこと）：
+• \`Chromeゼロデイ脆弱性\` の共有あり（#general）
+> 全社的にアップデート推奨。開発チームのブラウザ環境も確認しておくとよい
 
-• 来週ある商談の整理（初回 or 継続、準備のポイント）
-• 止まっている案件があれば軽く
+• 岩切さんが \`NoLangの○○機能\` について相談投稿（#dev）
+> まだ返信ついていない。方針をコメントしてあげると進みそう
 
-🛠 開発・タスク
+:chart_with_upwards_trend: 商談の状況
+
+来週の商談をさっと整理。
+
+出力フォーマット（この通りに書くこと）：
+• 月 \`川口市\` 齋藤様（初回）
+> 自治体DXの文脈。先方はAI活用に前向き
+
+• 火 \`大広wedo\`（継続・対面）
+> 前回の宿題は○○。今回は△△まで詰めたい
+
+:wrench: 開発・タスク
 
 • Notionのタスクで気にしておくべきもの
 • 期限が近いもの、止まっているもの
 
-💡 ひとこと
+:bulb: ひとこと
 
 全体を見て気づいたことを1-2点。気軽に。`, 8000);
   sections.push(sec3);
@@ -593,34 +620,83 @@ async function factCheck(review, summary) {
   return await callClaude(
     `ファクトチェッカー。レビュー内の人名・日時が元データと一致するか確認してください。
 
-重要：レビューの「分析・判断・提案」の部分はそのまま保持してください。
-事実の誤り（名前の間違い、日時の間違い、存在しない情報）のみを修正。
-レビューの構成やトーンは変えないでください。
-問題がなければ元のレビューをそのまま出力。`,
+重要ルール：
+- レビューの構成・トーン・Slack書式（バッククォート、引用ブロック、ショートコード絵文字）は一切変えない
+- 事実の誤り（名前の間違い、日時の間違い、存在しない情報）のみを修正
+- 問題がなければ元のレビューをそのまま出力`,
     `【レビュー】\n${review}\n\n【元データ（照合用）】\n${s}`, 12000
   );
 }
 
-// --- Slack投稿 ---
+// --- テキストサニタイズ（文字化け防止） ---
+function sanitizeText(text) {
+  // サロゲートペアの壊れた絵文字を除去
+  return text
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')  // 孤立した上位サロゲート
+    .replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '')  // 孤立した下位サロゲート
+    .replace(/\uFFFD/g, '')  // 置換文字
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');  // 制御文字
+}
+
+// --- Slack投稿（Blocks API使用 → mrkdwn確実レンダリング） ---
 async function post(message) {
-  const chunks = [];
-  let rem = message;
-  while (rem.length > 0) {
-    if (rem.length <= 3900) { chunks.push(rem); break; }
-    let s = rem.lastIndexOf('\n', 3900);
-    if (s < 1000) s = 3900;
-    chunks.push(rem.substring(0, s));
-    rem = rem.substring(s + 1);
+  message = sanitizeText(message);
+
+  // セクション分割（--- で区切られている）
+  const rawSections = message.split(/\n---\n/).map(s => s.trim()).filter(Boolean);
+
+  // 各セクションを Slack blocks に変換
+  // Slack blocks の1セクションは3000文字制限があるので分割
+  const MAX_BLOCK_TEXT = 2900;
+  const allBlocks = [];
+
+  for (const section of rawSections) {
+    if (section.length <= MAX_BLOCK_TEXT) {
+      allBlocks.push({ type: 'section', text: { type: 'mrkdwn', text: section } });
+    } else {
+      // 改行で分割して3000文字以内のチャンクにする
+      const lines = section.split('\n');
+      let chunk = '';
+      for (const line of lines) {
+        if ((chunk + '\n' + line).length > MAX_BLOCK_TEXT) {
+          if (chunk) allBlocks.push({ type: 'section', text: { type: 'mrkdwn', text: chunk } });
+          chunk = line;
+        } else {
+          chunk = chunk ? chunk + '\n' + line : line;
+        }
+      }
+      if (chunk) allBlocks.push({ type: 'section', text: { type: 'mrkdwn', text: chunk } });
+    }
+    // セクション間にdivider
+    allBlocks.push({ type: 'divider' });
   }
-  for (let i = 0; i < chunks.length; i++) {
+
+  // 末尾のdividerを除去
+  if (allBlocks.length > 0 && allBlocks[allBlocks.length - 1].type === 'divider') {
+    allBlocks.pop();
+  }
+
+  // Slack blocks は1メッセージ50ブロック制限
+  const BLOCKS_PER_MSG = 48;
+  const messageChunks = [];
+  for (let i = 0; i < allBlocks.length; i += BLOCKS_PER_MSG) {
+    messageChunks.push(allBlocks.slice(i, i + BLOCKS_PER_MSG));
+  }
+
+  for (let i = 0; i < messageChunks.length; i++) {
     const r = await httpRequest('https://slack.com/api/chat.postMessage', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json; charset=utf-8', Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
-    }, JSON.stringify({ channel: SLACK_CHANNEL_ID, text: chunks[i], unfurl_links: false }));
+    }, JSON.stringify({
+      channel: SLACK_CHANNEL_ID,
+      text: '週次レビュー',  // blocks非対応クライアント向けフォールバック
+      blocks: messageChunks[i],
+      unfurl_links: false,
+    }));
     if (!r.data.ok) throw new Error(`Slack: ${JSON.stringify(r.data)}`);
-    if (i < chunks.length - 1) await sleep(1000);
+    if (i < messageChunks.length - 1) await sleep(1000);
   }
-  console.log(`✅ Slack投稿完了 (${chunks.length}メッセージ)`);
+  console.log(`✅ Slack投稿完了 (${messageChunks.length}メッセージ, ${allBlocks.length}ブロック)`);
 }
 
 // ================================================================
