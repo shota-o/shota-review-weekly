@@ -2,42 +2,32 @@ name: 週次レビュー自動実行
 
 on:
   schedule:
-    # 毎週日曜 9:00 JST（= UTC 0:00）
+    # 毎週日曜 朝9時（JST） = 日曜 0:00 UTC
     - cron: '0 0 * * 0'
-  # 手動実行ボタン（テスト用）
-  workflow_dispatch:
+  workflow_dispatch: # 手動実行も可能
 
 jobs:
   weekly-review:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - name: リポジトリをチェックアウト
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Node.js セットアップ
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Claude Code をインストール
-        run: npm install -g @anthropic-ai/claude-code
+      - name: Install dependencies
+        run: npm install
 
-      - name: MCP サーバーをインストール
-        run: |
-          npm install -g \
-            @notionhq/notion-mcp-server \
-            @modelcontextprotocol/server-google-calendar \
-            @modelcontextprotocol/server-gmail
-
-      - name: 週次レビューを実行して Slack に投稿
+      - name: Run weekly review
         env:
-          ANTHROPIC_API_KEY:      ${{ secrets.ANTHROPIC_API_KEY }}
-          NOTION_TOKEN:           ${{ secrets.NOTION_TOKEN }}
-          GOOGLE_CLIENT_ID:       ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET:   ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_REFRESH_TOKEN:   ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          SLACK_BOT_TOKEN:        ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL_ID:       ${{ secrets.SLACK_CHANNEL_ID }}
-        run: |
-          node scripts/run-weekly-review.js
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+        run: node scripts/run-weekly-review.js

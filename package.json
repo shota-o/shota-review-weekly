@@ -1,0 +1,9 @@
+{
+  "name": "shota-weekly",
+  "version": "1.0.0",
+  "description": "週次レビュー自動化（Notion + Gmail + Calendar → Slack）",
+  "private": true,
+  "scripts": {
+    "review": "node scripts/run-weekly-review.js"
+  }
+}

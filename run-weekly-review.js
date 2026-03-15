@@ -1,43 +1,352 @@
-#!/usr/bin/env node
-/**
- * Claude Code を非対話モードで起動し、週次レビューを実行する
- * GitHub Actions から呼ばれる
- */
+// ============================================================
+// 週次レビュー自動化スクリプト
+// Notion + Gmail + Google Calendar → Anthropic API → Slack
+// ============================================================
 
-const { execSync } = require('child_process');
-const path = require('path');
+const https = require('https');
+const querystring = require('querystring');
 
-const prompt = `
-今日は日曜日です。CLAUDE.md の手順に従って週次レビューを実行してください。
+// --- 環境変数 ---
+const {
+  ANTHROPIC_API_KEY,
+  NOTION_TOKEN,
+  SLACK_BOT_TOKEN,
+  SLACK_CHANNEL_ID,
+  GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET,
+  GOOGLE_REFRESH_TOKEN,
+} = process.env;
 
-1. Google Calendar・Gmail・Notion から今週・来週のデータを漏れなく収集
-2. 優先順位を分析
-3. CLAUDE.md のフォーマットで Slack に投稿
-
-必ず最後に Slack への投稿まで完了させてください。
-`.trim();
-
-console.log('=== 週次レビュー開始 ===');
-console.log('実行時刻:', new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }));
-
-try {
-  execSync(
-    `claude --print --no-update-notifier "${prompt.replace(/"/g, '\\"')}"`,
-    {
-      cwd: path.resolve(__dirname, '..'),
-      stdio: 'inherit',
-      env: {
-        ...process.env,
-        // MCP設定ファイルのパスを明示
-        CLAUDE_MCP_CONFIG: path.resolve(__dirname, '../.claude/mcp.json'),
-      },
-      // タイムアウト: 10分
-      timeout: 10 * 60 * 1000,
-    }
-  );
-  console.log('=== 週次レビュー完了 ===');
-} catch (e) {
-  console.error('=== エラーが発生しました ===');
-  console.error(e.message);
-  process.exit(1);
+// --- ユーティリティ ---
+function httpRequest(url, options, body) {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const opts = {
+      hostname: urlObj.hostname,
+      path: urlObj.pathname + urlObj.search,
+      method: options.method || 'GET',
+      headers: options.headers || {},
+    };
+    const req = https.request(opts, (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => {
+        try {
+          resolve({ status: res.statusCode, data: JSON.parse(data) });
+        } catch {
+          resolve({ status: res.statusCode, data: data });
+        }
+      });
+    });
+    req.on('error', reject);
+    if (body) req.write(typeof body === 'string' ? body : JSON.stringify(body));
+    req.end();
+  });
 }
+
+// --- Google: Access Token取得 ---
+async function getGoogleAccessToken() {
+  const body = querystring.stringify({
+    client_id: GOOGLE_CLIENT_ID,
+    client_secret: GOOGLE_CLIENT_SECRET,
+    refresh_token: GOOGLE_REFRESH_TOKEN,
+    grant_type: 'refresh_token',
+  });
+  const res = await httpRequest('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  }, body);
+  if (res.data.access_token) {
+    console.log('✅ Google Access Token 取得成功');
+    return res.data.access_token;
+  }
+  throw new Error('Google Token取得失敗: ' + JSON.stringify(res.data));
+}
+
+// --- Google Calendar: 今週・来週の予定取得 ---
+async function getCalendarEvents(accessToken) {
+  const now = new Date();
+  const startOfWeek = new Date(now);
+  startOfWeek.setDate(now.getDate() - now.getDay() + 1); // 月曜
+  startOfWeek.setHours(0, 0, 0, 0);
+
+  const endOfNextWeek = new Date(startOfWeek);
+  endOfNextWeek.setDate(startOfWeek.getDate() + 13); // 来週日曜まで
+  endOfNextWeek.setHours(23, 59, 59, 999);
+
+  const params = new URLSearchParams({
+    timeMin: startOfWeek.toISOString(),
+    timeMax: endOfNextWeek.toISOString(),
+    singleEvents: 'true',
+    orderBy: 'startTime',
+    maxResults: '50',
+  });
+
+  const res = await httpRequest(
+    `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+
+  if (res.status !== 200) {
+    console.error('Calendar API エラー:', res.data);
+    return [];
+  }
+
+  const events = (res.data.items || []).map((e) => ({
+    title: e.summary || '(無題)',
+    start: e.start?.dateTime || e.start?.date || '',
+    end: e.end?.dateTime || e.end?.date || '',
+    attendees: (e.attendees || []).map((a) => a.email).join(', '),
+  }));
+
+  console.log(`✅ Calendar: ${events.length}件の予定を取得`);
+  return events;
+}
+
+// --- Gmail: 送信メール・未返信確認 ---
+async function getGmailData(accessToken) {
+  // 過去14日間の送信メール
+  const twoWeeksAgo = Math.floor((Date.now() - 14 * 86400 * 1000) / 1000);
+  const query = `in:sent after:${twoWeeksAgo}`;
+  const params = new URLSearchParams({ q: query, maxResults: '30' });
+
+  const listRes = await httpRequest(
+    `https://www.googleapis.com/gmail/v1/users/me/messages?${params}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+
+  if (listRes.status !== 200 || !listRes.data.messages) {
+    console.log('Gmail: 送信メールなし or エラー');
+    return { sent: [], unreplied: [] };
+  }
+
+  const sentEmails = [];
+  // 最新15件の詳細を取得
+  const messageIds = listRes.data.messages.slice(0, 15);
+
+  for (const msg of messageIds) {
+    const detailRes = await httpRequest(
+      `https://www.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata&metadataHeaders=Subject&metadataHeaders=To&metadataHeaders=Date`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    if (detailRes.status === 200) {
+      const headers = detailRes.data.payload?.headers || [];
+      sentEmails.push({
+        subject: headers.find((h) => h.name === 'Subject')?.value || '(件名なし)',
+        to: headers.find((h) => h.name === 'To')?.value || '',
+        date: headers.find((h) => h.name === 'Date')?.value || '',
+        threadId: detailRes.data.threadId,
+      });
+    }
+  }
+
+  // 各スレッドの返信チェック（送ったが返信がないもの）
+  const unreplied = [];
+  for (const email of sentEmails) {
+    const threadRes = await httpRequest(
+      `https://www.googleapis.com/gmail/v1/users/me/threads/${email.threadId}?format=metadata&metadataHeaders=From`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    if (threadRes.status === 200) {
+      const messages = threadRes.data.messages || [];
+      const lastMsg = messages[messages.length - 1];
+      const lastFrom = (lastMsg?.payload?.headers || []).find((h) => h.name === 'From')?.value || '';
+      // 最後のメッセージが自分からの送信（＝返信がまだない）
+      if (lastFrom.includes(GOOGLE_CLIENT_ID) === false && messages.length === 1) {
+        unreplied.push(email);
+      }
+    }
+  }
+
+  console.log(`✅ Gmail: 送信${sentEmails.length}件, 未返信候補${unreplied.length}件`);
+  return { sent: sentEmails, unreplied };
+}
+
+// --- Notion: データベースから取得 ---
+async function getNotionData() {
+  // Notionの全データベースを検索
+  const searchRes = await httpRequest('https://api.notion.com/v1/search', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${NOTION_TOKEN}`,
+      'Content-Type': 'application/json',
+      'Notion-Version': '2022-06-28',
+    },
+  }, JSON.stringify({
+    filter: { property: 'object', value: 'database' },
+    page_size: 20,
+  }));
+
+  if (searchRes.status !== 200) {
+    console.error('Notion検索エラー:', searchRes.data);
+    return { databases: [], pages: [] };
+  }
+
+  const databases = searchRes.data.results || [];
+  console.log(`✅ Notion: ${databases.length}個のDBを発見`);
+
+  const allPages = [];
+
+  for (const db of databases) {
+    const dbTitle = db.title?.map((t) => t.plain_text).join('') || '(無名DB)';
+    const queryRes = await httpRequest(`https://api.notion.com/v1/databases/${db.id}/query`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${NOTION_TOKEN}`,
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28',
+      },
+    }, JSON.stringify({ page_size: 30 }));
+
+    if (queryRes.status === 200) {
+      const pages = (queryRes.data.results || []).map((p) => {
+        const props = {};
+        for (const [key, val] of Object.entries(p.properties || {})) {
+          if (val.type === 'title') {
+            props[key] = val.title?.map((t) => t.plain_text).join('') || '';
+          } else if (val.type === 'select') {
+            props[key] = val.select?.name || '';
+          } else if (val.type === 'status') {
+            props[key] = val.status?.name || '';
+          } else if (val.type === 'date') {
+            props[key] = val.date?.start || '';
+          } else if (val.type === 'rich_text') {
+            props[key] = val.rich_text?.map((t) => t.plain_text).join('') || '';
+          } else if (val.type === 'number') {
+            props[key] = val.number;
+          } else if (val.type === 'checkbox') {
+            props[key] = val.checkbox;
+          } else if (val.type === 'multi_select') {
+            props[key] = val.multi_select?.map((s) => s.name).join(', ') || '';
+          }
+        }
+        return { database: dbTitle, properties: props };
+      });
+      allPages.push(...pages);
+    }
+  }
+
+  console.log(`✅ Notion: 合計${allPages.length}件のページを取得`);
+  return { databases: databases.map((d) => d.title?.map((t) => t.plain_text).join('') || ''), pages: allPages };
+}
+
+// --- Anthropic API: サマリー生成 ---
+async function generateSummary(calendarEvents, gmailData, notionData) {
+  const now = new Date();
+  const jstNow = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+  const dateStr = jstNow.toISOString().split('T')[0];
+
+  const prompt = `あなたは優秀な営業アシスタントです。以下のデータを分析して、日本語で週次レビューを作成してください。
+
+今日の日付: ${dateStr}（日曜日）
+
+## Google Calendarの予定
+${JSON.stringify(calendarEvents, null, 2)}
+
+## Gmailの送信メール（過去14日間）
+送信メール: ${JSON.stringify(gmailData.sent, null, 2)}
+未返信候補: ${JSON.stringify(gmailData.unreplied, null, 2)}
+
+## Notionのデータ
+データベース一覧: ${JSON.stringify(notionData.databases)}
+ページデータ: ${JSON.stringify(notionData.pages, null, 2)}
+
+---
+
+以下のフォーマットで出力してください：
+
+📋 **今週の振り返り**
+- 今週行った主な商談・会議・作業を箇条書き
+
+📌 **来週やるべきこと（優先度順）**
+- 来週のカレンダー予定と、それに向けた準備事項
+- Notionのタスクから未完了のもの
+
+📧 **フォローアップが必要なメール**
+- 送ったが返信がないメール（相手名・件名・送信日）
+- 二通目を送るべきメール
+
+⚠️ **注意事項・リスク**
+- 期限が近いタスク
+- 長期間放置されている商談
+
+各項目は簡潔に。絵文字を適度に使って見やすくしてください。`;
+
+  const res = await httpRequest('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+  }, JSON.stringify({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 4000,
+    messages: [{ role: 'user', content: prompt }],
+  }));
+
+  if (res.status !== 200) {
+    throw new Error('Anthropic API エラー: ' + JSON.stringify(res.data));
+  }
+
+  const text = res.data.content?.map((c) => c.text).join('') || '';
+  console.log('✅ Anthropic: サマリー生成完了');
+  return text;
+}
+
+// --- Slack投稿 ---
+async function postToSlack(message) {
+  const res = await httpRequest('https://slack.com/api/chat.postMessage', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
+    },
+  }, JSON.stringify({
+    channel: SLACK_CHANNEL_ID,
+    text: message,
+    unfurl_links: false,
+  }));
+
+  if (res.data.ok) {
+    console.log('✅ Slack投稿完了');
+  } else {
+    throw new Error('Slack投稿エラー: ' + JSON.stringify(res.data));
+  }
+}
+
+// --- メイン ---
+async function main() {
+  console.log('=== 週次レビュー開始 ===');
+  console.log('実行時刻:', new Date().toISOString());
+
+  // 環境変数チェック
+  const required = ['ANTHROPIC_API_KEY', 'NOTION_TOKEN', 'SLACK_BOT_TOKEN', 'SLACK_CHANNEL_ID', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN'];
+  const missing = required.filter((k) => !process.env[k]);
+  if (missing.length > 0) {
+    throw new Error('環境変数が未設定: ' + missing.join(', '));
+  }
+
+  // 1. Google Access Token取得
+  const googleToken = await getGoogleAccessToken();
+
+  // 2. データ収集（並列実行）
+  const [calendarEvents, gmailData, notionData] = await Promise.all([
+    getCalendarEvents(googleToken),
+    getGmailData(googleToken),
+    getNotionData(),
+  ]);
+
+  // 3. Anthropic APIでサマリー生成
+  const summary = await generateSummary(calendarEvents, gmailData, notionData);
+
+  // 4. Slack投稿
+  await postToSlack(summary);
+
+  console.log('=== 週次レビュー完了 ===');
+}
+
+main().catch((err) => {
+  console.error('❌ エラー:', err.message);
+  process.exit(1);
+});
