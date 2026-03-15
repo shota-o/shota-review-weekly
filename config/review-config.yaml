@@ -1,0 +1,49 @@
+# 週次レビュー設定
+# このファイルを編集することで、レビューの範囲や内容をカスタマイズできます
+
+# データ収集設定
+collection:
+  gmail:
+    # 何日前まで遡るか
+    lookback_days: 14
+    # メール本文を取得するか（true推奨）
+    fetch_body: true
+    # 本文の最大文字数（0 = 無制限）
+    body_max_chars: 1000
+    # 取得する最大件数（受信・送信それぞれ）
+    max_messages: 50
+  
+  calendar:
+    # 過去何日分を振り返るか
+    past_days: 7
+    # 未来何日分を表示するか
+    future_days: 7
+    # イベントの説明文も取得するか
+    fetch_description: true
+  
+  notion:
+    # ページの本文（ブロック）も取得するか
+    fetch_blocks: true
+    # 取得するブロック数の上限（ページあたり）
+    max_blocks_per_page: 50
+    # 最近編集されたページの取得件数
+    recent_pages_limit: 30
+
+# 分析設定
+analysis:
+  # Claude APIモデル
+  model: "claude-sonnet-4-20250514"
+  # 各分析ステージの最大トークン
+  max_tokens_per_stage: 8000
+  # 最終レビューの最大トークン
+  max_tokens_final: 12000
+  # 事実確認パスを実行するか（推奨: true）
+  fact_check: true
+
+# 出力設定
+output:
+  # Slack投稿時のメッセージ分割サイズ
+  slack_chunk_size: 3900
+  # タイムゾーン
+  timezone: "Asia/Tokyo"
+  timezone_offset_hours: 9
