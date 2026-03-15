@@ -77,12 +77,12 @@ async function callClaude(system, user, maxTokens = 8000) {
 
 // 配列データをバッチ分割してClaudeに投げ、結果を統合
 async function batchAnalyze(system, items, instruction, label) {
-  const BATCH_TOKEN_TARGET = 100000; // 1バッチあたりの目標トークン数
+  const BATCH_TOKEN_TARGET = 100000;
 
   // 全体が収まるならそのまま
   const allStr = JSON.stringify(items, null, 2);
   if (estimateTokens(allStr) + estimateTokens(instruction) < TOKEN_LIMIT) {
-    return await callClaude(system, `${instruction}\n\nデータ（${items.length}件）:\n${allStr}`);
+    return await callClaude(system, `${instruction}\n\n絶対ルール：「他X件」「等」のような省略は禁止。該当する項目は全件列挙すること。\n\nデータ（${items.length}件）:\n${allStr}`);
   }
 
   // バッチサイズを推定
@@ -94,27 +94,26 @@ async function batchAnalyze(system, items, instruction, label) {
     batches.push(items.slice(i, i + batchSize));
   }
 
-  console.log(`  ${label}: ${items.length}件 → ${batches.length}バッチ（各${batchSize}件）`);
+  console.log(`  ${label}: ${items.length}件 → ${batches.length}バッチ（各~${batchSize}件）`);
 
   const results = [];
   for (let i = 0; i < batches.length; i++) {
     const batchStr = JSON.stringify(batches[i], null, 2);
     console.log(`  ${label} バッチ${i + 1}/${batches.length} (${batches[i].length}件, ~${estimateTokens(batchStr)}トークン)`);
-    const result = await callClaude(system, `${instruction}\n\nデータ（バッチ${i + 1}/${batches.length}、${batches[i].length}件）:\n${batchStr}`);
+    const result = await callClaude(system,
+      `${instruction}\n\n絶対ルール：「他X件」「等」のような省略は禁止。該当する項目は全件列挙すること。\n\nデータ（バッチ${i + 1}/${batches.length}、${batches[i].length}件）:\n${batchStr}`);
     results.push(result);
   }
 
-  // バッチが2以上なら結果を統合
+  // バッチが2以上なら結果を統合（全件保持）
   if (results.length > 1) {
     console.log(`  ${label}: ${results.length}バッチの結果を統合中...`);
-    const combined = results.map((r, i) => `--- バッチ${i + 1}の分析 ---\n${r}`).join('\n\n');
+    const combined = results.map((r, i) => `--- バッチ${i + 1} ---\n${r}`).join('\n\n');
 
-    // 統合結果もトークン制限チェック
     if (estimateTokens(combined) < TOKEN_LIMIT) {
       return await callClaude(system,
-        `以下は同じデータセットを分割分析した結果です。重複を排除し、統合してください。\n\n${combined}`);
+        `以下は同じデータセットを分割分析した結果です。全ての項目を保持したまま統合してください。項目を省略・圧縮しないこと。重複のみ排除。\n\n${combined}`);
     }
-    // 統合できない場合はそのまま連結
     return combined;
   }
 
@@ -445,31 +444,25 @@ async function analyzeSlack(messages) {
 
 // --- 統合 ---
 async function synthesize(gmail, calendar, notion, slack) {
-  console.log('\n=== Stage 5: 統合レビュー ===');
+  console.log('\n=== Stage 5: 統合レビュー（セクション別生成） ===');
 
   const sys = `あなたは株式会社Mavericks 代表取締役 奥野翔太の右腕です。
-毎週日曜にサクッと1週間を振り返って、来週の段取りをまとめます。
-
-トーン：
-- 明るく、テンポよく。深刻ぶらない。
-- 「⚠️警告」「🚨緊急」みたいな大袈裟な表現は使わない。
-- フレンドリーだけど中身はしっかり。
-- 軽いコメントや一言を添えてOK。読んで楽しい出力にする。
-
-中身のルール：
-- カレンダーの転記はしない。分析と段取りを書く。
-- フォローアップは漏れなく全件載せる。絞り込みすぎない。
+トーン：明るく、テンポよく。大袈裟にしない。フレンドリーだけど中身はしっかり。
+ルール：
+- 「他X件」「等」のような省略は絶対禁止。該当する項目は全件書くこと。
 - 具体的な人名・会社名・日時を含める。伏字禁止。
 - データにない推測はしない。
 - Slack記法（*太字*、•箇条書き）を使用。`;
 
+  // 入力データを要約（大きい場合）
   let input = `【Gmail分析】\n${gmail}\n\n【Calendar分析】\n${calendar}\n\n【Notion分析】\n${notion}\n\n【Slack分析】\n${slack}`;
 
   if (estimateTokens(input) > TOKEN_LIMIT) {
-    console.log('  統合入力が大きいため、各分析を要約中...');
+    console.log('  入力が大きいため要約中...');
     const summarize = async (name, text) => {
-      if (estimateTokens(text) > 30000) {
-        return await callClaude(SYS, `以下の${name}分析結果を、アクションアイテムと事実を漏れなく保持しつつコンパクトにまとめてください。\n\n${text}`);
+      if (estimateTokens(text) > 25000) {
+        return await callClaude(SYS,
+          `以下の${name}分析結果を要約してください。ただし個別の項目（メール件名、相手名、タスク名等）は全件保持すること。「他X件」のような省略は禁止。構造やコメントを圧縮して、リスト自体は全件残してください。\n\n${text}`);
       }
       return text;
     };
@@ -480,40 +473,71 @@ async function synthesize(gmail, calendar, notion, slack) {
     input = `【Gmail分析】\n${gmail}\n\n【Calendar分析】\n${calendar}\n\n【Notion分析】\n${notion}\n\n【Slack分析】\n${slack}`;
   }
 
-  const format = `\n\n以下の形式で出力してください。
+  // セクション別に生成
+  const sections = [];
 
-*☀️ 今週おつかれさまでした*
-今週やったことのハイライト。全件列挙ではなく、特に進展があったこと・印象的だったことを中心に。
-一言コメント付きで。
+  // セクション1: 今週 + 来週の段取り
+  console.log('  セクション1: 振り返り + 来週の段取り');
+  const sec1 = await callClaude(sys, `${input}\n\n以下の2セクションを出力してください。
 
-*📅 来週の段取り*
-日別にまとめるが、カレンダーの転記ではなく「こう動くといいよ」という段取りを書く。
-• 各日のポイント（何が大事で、何を準備しておくべきか）
-• 予定が重複している箇所は「どっちを優先するか」の提案付きで
-• 詰まっている日は「ここキツいので朝イチで準備しておくといい」みたいなアドバイス
+☀️ 今週おつかれさまでした
+今週のハイライト。全件列挙ではなく、進展があったこと・印象的だったことを中心に。一言コメント付き。
 
-*📧 メール関連のTODO*
-返信が必要なもの、フォローアップすべきもの、全て漏れなく載せる。
-• 未読で対応が必要なメール（差出人・件名・ひとことメモ）
-• 送ったけど返信がない相手（全件。いつ頃フォローするかの提案付き）
-• そろそろ二通目送った方がいい相手
+📅 来週これだけは押さえておくこと
+カレンダーの予定一覧を書く必要はない（それはカレンダーを見ればわかる）。
+代わりに以下を書く：
 
-*💬 Slackで拾っておくこと*
+• 準備が必要なイベントとその背景
+  例：「水曜の○○社は初回商談。先方は△△に課題を持っていて、メールでは□□に関心を示していた。提案資料のこの部分を厚くしておくと良い」
+  例：「木曜の公庫面談は資本性ローンの件。財務資料の最新版を前日までに確認しておくこと」
+
+• 「いつまでに何をやるべきか」のデッドライン整理
+  例：「火曜のPR TIMES修正版は月曜中に仕上げる必要あり」
+  例：「さくらインターネットのクレカ情報変更は金曜が期限」
+
+• スケジュール上の注意点
+  重複している予定があれば、どう対処するかの提案。
+  対面の予定は移動時間を考慮。`, 8000);
+  sections.push(sec1);
+
+  // セクション2: メール関連（全件出力）
+  console.log('  セクション2: メール関連TODO（全件）');
+  const sec2 = await callClaude(sys, `${input}\n\n以下のセクションを出力してください。「他X件」のような省略は絶対禁止。全件書くこと。
+
+📧 メール関連のTODO
+
+返信が必要な未読メール:
+（全件。差出人・件名・ひとことメモ付き）
+
+送ったけど返信がない相手:
+（全件。相手名・件名・送信日・いつ頃フォローするかの提案付き）
+
+そろそろ二通目送った方がいい相手:
+（全件。相手名・理由）`, 8000);
+  sections.push(sec2);
+
+  // セクション3: Slack + 商談 + 開発 + ひとこと
+  console.log('  セクション3: Slack + 商談 + 開発 + ひとこと');
+  const sec3 = await callClaude(sys, `${input}\n\n以下のセクションを出力してください。
+
+💬 Slackで拾っておくこと
 • 議論の中で出たアクションアイテム
 • 未回答の質問や共有された重要情報
 
-*📊 商談の状況*
+📊 商談の状況
 • 来週ある商談の簡単な整理（初回 or 継続、準備のポイント）
 • 止まっている案件があれば軽く触れる
 
-*🛠 開発・タスク*
+🛠 開発・タスク
 • Notionのタスクで気にしておくべきもの
 • 期限が近いもの、止まっているもの
 
-*💡 ひとこと*
-全体を見て気づいたことを1-2点。気軽なトーンで。`;
+💡 ひとこと
+全体を見て気づいたことを1-2点。気軽なトーンで。`, 8000);
+  sections.push(sec3);
 
-  return await callClaude(sys, input + format, 12000);
+  console.log('  ✅ 全セクション生成完了');
+  return sections.join('\n\n---\n\n');
 }
 
 // --- 事実確認 ---
