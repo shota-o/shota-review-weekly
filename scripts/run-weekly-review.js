@@ -1,23 +1,11 @@
 // ============================================================
-// 週次レビュー自動化スクリプト v4
+// 週次レビュー v4.1 - 安定版
 //
-// Stage 0: 全データ収集
-//   - Gmail: 7日間の全受送信（件数制限なし・本文付き）
-//   - Calendar: 過去7日+未来7日の全イベント
-//   - Notion: "Master Table" DBのみ、30日→14日フォールバック
-//   - Slack: 全チャンネル7日間のメッセージ
-// Stage 1: Gmail分析（Claude API）
-// Stage 2: Calendar分析（Claude API）
-// Stage 3: Notion分析（Claude API）
-// Stage 4: Slack分析（Claude API）
-// Stage 5: 統合レビュー生成（Claude API）
-// Stage 6: 事実確認（Claude API）
-// Stage 7: Slack投稿
+// 全てのClaude API呼び出しにトークン安全装置付き。
+// データが大きい場合は自動でバッチ分割→結果統合。
 // ============================================================
 
 const https = require('https');
-const fs = require('fs');
-const path = require('path');
 const querystring = require('querystring');
 
 const {
@@ -50,15 +38,87 @@ function httpRequest(url, options, body) {
   });
 }
 
-function truncate(str, len) {
-  if (!str || len === 0) return str || '';
-  return str.length > len ? str.substring(0, len) + '...' : str;
+function truncate(s, n) { return !s ? '' : s.length > n ? s.substring(0, n) + '...' : s; }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function estimateTokens(data) {
+  const s = typeof data === 'string' ? data : JSON.stringify(data);
+  return Math.ceil(s.length / 3);
+}
+function jstNow() { return new Date(Date.now() + 9 * 3600000); }
+
+// ================================================================
+// Claude API（安全装置付き）
+// ================================================================
+
+// 1回のAPI呼び出し上限: 120kトークン（200k上限に対し余裕を持たせる）
+const TOKEN_LIMIT = 120000;
+
+async function callClaude(system, user, maxTokens = 8000) {
+  const res = await httpRequest('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+  }, JSON.stringify({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: maxTokens,
+    system, messages: [{ role: 'user', content: user }],
+  }));
+
+  if (res.status !== 200) {
+    const msg = JSON.stringify(res.data).substring(0, 300);
+    console.error(`  Claude API error (${res.status}): ${msg}`);
+    throw new Error(`Claude API (${res.status})`);
+  }
+  return res.data.content?.map(c => c.text).join('') || '';
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+// 配列データをバッチ分割してClaudeに投げ、結果を統合
+async function batchAnalyze(system, items, instruction, label) {
+  const BATCH_TOKEN_TARGET = 100000; // 1バッチあたりの目標トークン数
 
-function jstDate(d) {
-  return new Date((d || new Date()).getTime() + 9 * 3600000);
+  // 全体が収まるならそのまま
+  const allStr = JSON.stringify(items, null, 2);
+  if (estimateTokens(allStr) + estimateTokens(instruction) < TOKEN_LIMIT) {
+    return await callClaude(system, `${instruction}\n\nデータ（${items.length}件）:\n${allStr}`);
+  }
+
+  // バッチサイズを推定
+  const avgTokensPerItem = estimateTokens(JSON.stringify(items[0], null, 2));
+  const batchSize = Math.max(10, Math.floor(BATCH_TOKEN_TARGET / avgTokensPerItem));
+
+  const batches = [];
+  for (let i = 0; i < items.length; i += batchSize) {
+    batches.push(items.slice(i, i + batchSize));
+  }
+
+  console.log(`  ${label}: ${items.length}件 → ${batches.length}バッチ（各${batchSize}件）`);
+
+  const results = [];
+  for (let i = 0; i < batches.length; i++) {
+    const batchStr = JSON.stringify(batches[i], null, 2);
+    console.log(`  ${label} バッチ${i + 1}/${batches.length} (${batches[i].length}件, ~${estimateTokens(batchStr)}トークン)`);
+    const result = await callClaude(system, `${instruction}\n\nデータ（バッチ${i + 1}/${batches.length}、${batches[i].length}件）:\n${batchStr}`);
+    results.push(result);
+  }
+
+  // バッチが2以上なら結果を統合
+  if (results.length > 1) {
+    console.log(`  ${label}: ${results.length}バッチの結果を統合中...`);
+    const combined = results.map((r, i) => `--- バッチ${i + 1}の分析 ---\n${r}`).join('\n\n');
+
+    // 統合結果もトークン制限チェック
+    if (estimateTokens(combined) < TOKEN_LIMIT) {
+      return await callClaude(system,
+        `以下は同じデータセットを分割分析した結果です。重複を排除し、統合してください。\n\n${combined}`);
+    }
+    // 統合できない場合はそのまま連結
+    return combined;
+  }
+
+  return results[0];
 }
 
 // ================================================================
@@ -74,582 +134,407 @@ async function getGoogleAccessToken() {
     method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
   }, body);
   if (res.data.access_token) return res.data.access_token;
-  throw new Error('Google Token取得失敗: ' + JSON.stringify(res.data));
+  throw new Error('Google Token失敗: ' + JSON.stringify(res.data));
 }
 
-// --- Gmail: 7日間の全受送信（件数制限なし） ---
+// --- Gmail ---
 async function collectGmail(accessToken) {
   const auth = { headers: { Authorization: `Bearer ${accessToken}` } };
 
   const profileRes = await httpRequest('https://www.googleapis.com/gmail/v1/users/me/profile', auth);
   if (profileRes.status !== 200) {
-    console.error('❌ Gmail API アクセス失敗:', JSON.stringify(profileRes.data));
+    console.error('❌ Gmail失敗');
     return { inbox: [], sent: [], awaitingReply: [], myEmail: '' };
   }
   const myEmail = profileRes.data.emailAddress;
-  console.log(`✅ Gmail: ${myEmail} に接続`);
+  console.log(`✅ Gmail: ${myEmail}`);
 
-  // メール詳細取得（本文付き・再帰パーツ探索）
-  async function getFullMessage(msgId) {
-    const detail = await httpRequest(
+  async function getMsg(msgId) {
+    const d = await httpRequest(
       `https://www.googleapis.com/gmail/v1/users/me/messages/${msgId}?format=full`, auth
     );
-    if (detail.status !== 200) return null;
+    if (d.status !== 200) return null;
+    const hh = d.data.payload?.headers || [];
+    const g = n => hh.find(h => h.name.toLowerCase() === n.toLowerCase())?.value || '';
 
-    const headers = detail.data.payload?.headers || [];
-    const getH = (n) => headers.find(h => h.name.toLowerCase() === n.toLowerCase())?.value || '';
-
-    let bodyText = '';
-    function extractText(part) {
+    let body = '';
+    (function extract(part) {
       if (!part) return;
-      if (part.mimeType === 'text/plain' && part.body?.data) {
-        bodyText += Buffer.from(part.body.data, 'base64').toString('utf-8');
-      }
-      if (part.parts) part.parts.forEach(extractText);
-    }
-    extractText(detail.data.payload);
-    if (!bodyText.trim()) bodyText = detail.data.snippet || '';
+      if (part.mimeType === 'text/plain' && part.body?.data)
+        body += Buffer.from(part.body.data, 'base64').toString('utf-8');
+      if (part.parts) part.parts.forEach(extract);
+    })(d.data.payload);
+    if (!body.trim()) body = d.data.snippet || '';
 
     return {
-      id: msgId, threadId: detail.data.threadId,
-      subject: getH('Subject') || '(件名なし)',
-      from: getH('From'), to: getH('To'), cc: getH('Cc'),
-      date: getH('Date'),
-      body: truncate(bodyText.replace(/[\r\n]{3,}/g, '\n\n').trim(), 1000),
-      labels: detail.data.labelIds || [],
+      id: msgId, threadId: d.data.threadId,
+      subject: g('Subject') || '(件名なし)',
+      from: g('From'), to: g('To'),
+      date: g('Date'),
+      body: truncate(body.replace(/[\r\n]{3,}/g, '\n').trim(), 500),
     };
   }
 
-  // ページネーション: 件数制限なしで全件取得
-  async function listAllMessages(query) {
-    const allMsgs = [];
-    let pageToken = null;
+  async function listAll(query) {
+    const all = [];
+    let pt = null;
     do {
-      const params = new URLSearchParams({ q: query, maxResults: '100' });
-      if (pageToken) params.set('pageToken', pageToken);
-      const res = await httpRequest(
-        `https://www.googleapis.com/gmail/v1/users/me/messages?${params}`, auth
-      );
-      if (res.status !== 200 || !res.data.messages) break;
-      allMsgs.push(...res.data.messages);
-      pageToken = res.data.nextPageToken;
-    } while (pageToken);
-    return allMsgs;
+      const p = new URLSearchParams({ q: query, maxResults: '100' });
+      if (pt) p.set('pageToken', pt);
+      const r = await httpRequest(`https://www.googleapis.com/gmail/v1/users/me/messages?${p}`, auth);
+      if (r.status !== 200 || !r.data.messages) break;
+      all.push(...r.data.messages);
+      pt = r.data.nextPageToken;
+    } while (pt);
+    return all;
   }
 
-  // 7日間の全受信
-  console.log('  Gmail: 7日間の受信メール取得中...');
-  const inboxMsgIds = await listAllMessages('in:inbox newer_than:7d');
-  console.log(`  受信メッセージID: ${inboxMsgIds.length}件`);
-  const inboxEmails = [];
-  for (const msg of inboxMsgIds) {
-    const detail = await getFullMessage(msg.id);
-    if (detail) inboxEmails.push(detail);
-  }
-  console.log(`  ✅ 受信: ${inboxEmails.length}件（本文付き）`);
+  // 受信
+  console.log('  受信メール取得中...');
+  const inboxIds = await listAll('in:inbox newer_than:7d');
+  const inbox = [];
+  for (const m of inboxIds) { const d = await getMsg(m.id); if (d) inbox.push(d); }
+  console.log(`  ✅ 受信: ${inbox.length}件`);
 
-  // 7日間の全送信
-  console.log('  Gmail: 7日間の送信メール取得中...');
-  const sentMsgIds = await listAllMessages('in:sent newer_than:7d');
-  console.log(`  送信メッセージID: ${sentMsgIds.length}件`);
-  const sentEmails = [];
-  for (const msg of sentMsgIds) {
-    const detail = await getFullMessage(msg.id);
-    if (detail) sentEmails.push(detail);
-  }
-  console.log(`  ✅ 送信: ${sentEmails.length}件（本文付き）`);
+  // 送信
+  console.log('  送信メール取得中...');
+  const sentIds = await listAll('in:sent newer_than:7d');
+  const sent = [];
+  for (const m of sentIds) { const d = await getMsg(m.id); if (d) sent.push(d); }
+  console.log(`  ✅ 送信: ${sent.length}件`);
 
-  // スレッド分析（未返信検出）
-  console.log('  Gmail: スレッド分析中...');
-  const threadMap = new Map();
-  for (const email of sentEmails) {
-    if (threadMap.has(email.threadId)) continue;
-    const threadRes = await httpRequest(
-      `https://www.googleapis.com/gmail/v1/users/me/threads/${email.threadId}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`,
-      auth
+  // 返信待ち
+  console.log('  スレッド分析中...');
+  const tMap = new Map();
+  for (const e of sent) {
+    if (tMap.has(e.threadId)) continue;
+    const r = await httpRequest(
+      `https://www.googleapis.com/gmail/v1/users/me/threads/${e.threadId}?format=metadata&metadataHeaders=From`, auth
     );
-    if (threadRes.status === 200) {
-      const msgs = threadRes.data.messages || [];
-      const lastMsg = msgs[msgs.length - 1];
-      const lastFrom = (lastMsg?.payload?.headers || []).find(h => h.name === 'From')?.value || '';
-      threadMap.set(email.threadId, {
-        messageCount: msgs.length, lastFrom,
-        isAwaitingReply: msgs.length === 1 || lastFrom.includes(myEmail),
-        subject: email.subject, to: email.to, date: email.date,
-      });
+    if (r.status === 200) {
+      const msgs = r.data.messages || [];
+      const last = (msgs[msgs.length - 1]?.payload?.headers || []).find(h => h.name === 'From')?.value || '';
+      if (msgs.length === 1 || last.includes(myEmail)) {
+        tMap.set(e.threadId, { subject: e.subject, to: e.to, date: e.date });
+      }
     }
   }
+  const awaiting = [...tMap.values()];
+  console.log(`  ✅ 返信待ち: ${awaiting.length}件`);
 
-  const awaitingReply = [];
-  for (const [threadId, info] of threadMap) {
-    if (info.isAwaitingReply) awaitingReply.push({ threadId, ...info });
-  }
-  console.log(`  ✅ 返信待ち: ${awaitingReply.length}件`);
-
-  return { inbox: inboxEmails, sent: sentEmails, awaitingReply, myEmail };
+  return { inbox, sent, awaitingReply: awaiting, myEmail };
 }
 
-// --- Google Calendar ---
+// --- Calendar ---
 async function collectCalendar(accessToken) {
   const now = new Date();
   const start = new Date(now); start.setDate(start.getDate() - 7); start.setHours(0, 0, 0, 0);
   const end = new Date(now); end.setDate(end.getDate() + 7); end.setHours(23, 59, 59, 999);
 
-  const allEvents = [];
-  let pageToken = null;
+  const all = [];
+  let pt = null;
   do {
-    const params = new URLSearchParams({
+    const p = new URLSearchParams({
       timeMin: start.toISOString(), timeMax: end.toISOString(),
       singleEvents: 'true', orderBy: 'startTime', maxResults: '250',
     });
-    if (pageToken) params.set('pageToken', pageToken);
-
-    const res = await httpRequest(
-      `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
+    if (pt) p.set('pageToken', pt);
+    const r = await httpRequest(
+      `https://www.googleapis.com/calendar/v3/calendars/primary/events?${p}`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
-    if (res.status !== 200) { console.error('Calendar API エラー:', res.data); break; }
+    if (r.status !== 200) break;
 
-    allEvents.push(...(res.data.items || []).map(e => ({
+    all.push(...(r.data.items || []).map(e => ({
       title: e.summary || '(無題)',
       start: e.start?.dateTime || e.start?.date || '',
       end: e.end?.dateTime || e.end?.date || '',
       location: e.location || '',
-      description: truncate(e.description, 500),
+      description: truncate(e.description, 200),
       attendees: (e.attendees || []).filter(a => !a.resource)
-        .map(a => ({ name: a.displayName || '', email: a.email, response: a.responseStatus })),
+        .map(a => a.displayName || a.email).join(', '),
       organizer: e.organizer?.displayName || e.organizer?.email || '',
-      meetLink: e.hangoutLink || '',
     })));
-    pageToken = res.data.nextPageToken;
-  } while (pageToken);
+    pt = r.data.nextPageToken;
+  } while (pt);
 
-  console.log(`✅ Calendar: ${allEvents.length}件のイベントを取得`);
-  return allEvents;
+  console.log(`✅ Calendar: ${all.length}件`);
+  return all;
 }
 
-// --- Notion: "Master Table" DBのみ、30日→14日フォールバック ---
+// --- Notion ---
 async function collectNotion() {
-  const headers = {
+  const h = {
     Authorization: `Bearer ${NOTION_TOKEN}`,
     'Content-Type': 'application/json',
     'Notion-Version': '2022-06-28',
   };
 
-  // 全DB検索
-  const allDatabases = [];
-  let hasMore = true, startCursor = undefined;
-  while (hasMore) {
-    const body = { filter: { property: 'object', value: 'database' }, page_size: 100 };
-    if (startCursor) body.start_cursor = startCursor;
-    const res = await httpRequest('https://api.notion.com/v1/search', { method: 'POST', headers }, JSON.stringify(body));
-    if (res.status !== 200) break;
-    allDatabases.push(...(res.data.results || []));
-    hasMore = res.data.has_more;
-    startCursor = res.data.next_cursor;
+  const dbs = [];
+  let more = true, cur;
+  while (more) {
+    const b = { filter: { property: 'object', value: 'database' }, page_size: 100 };
+    if (cur) b.start_cursor = cur;
+    const r = await httpRequest('https://api.notion.com/v1/search', { method: 'POST', headers: h }, JSON.stringify(b));
+    if (r.status !== 200) break;
+    dbs.push(...(r.data.results || []));
+    more = r.data.has_more; cur = r.data.next_cursor;
   }
 
-  // "Master Table" を含むDBのみフィルタ
-  const masterDbs = allDatabases.filter(db => {
-    const title = db.title?.map(t => t.plain_text).join('') || '';
-    return title.includes('Master') || title.includes('master');
+  const masterDbs = dbs.filter(d => {
+    const t = d.title?.map(x => x.plain_text).join('') || '';
+    return t.toLowerCase().includes('master');
   });
+  console.log(`✅ Notion: ${dbs.length}個中 ${masterDbs.length}個の Master DB`);
 
-  console.log(`✅ Notion: ${allDatabases.length}個中 ${masterDbs.length}個の Master Table DBを選択`);
-  masterDbs.forEach(db => {
-    const title = db.title?.map(t => t.plain_text).join('') || '(無名)';
-    console.log(`  - ${title}`);
-  });
+  const thirtyAgo = new Date(Date.now() - 30 * 86400000).toISOString();
+  const fourteenAgo = new Date(Date.now() - 14 * 86400000).toISOString();
 
-  // 30日以内のレコードを取得
-  const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString();
-  const fourteenDaysAgo = new Date(Date.now() - 14 * 86400000).toISOString();
-
-  const allRecords = [];
+  const recs = [];
   for (const db of masterDbs) {
-    const dbTitle = db.title?.map(t => t.plain_text).join('') || '(無名DB)';
-    let dbHasMore = true, dbCursor = undefined;
-    const dbRecords = [];
+    const title = db.title?.map(x => x.plain_text).join('') || '(無名)';
+    let dm = true, dc;
+    while (dm) {
+      const b = { page_size: 100, sorts: [{ timestamp: 'last_edited_time', direction: 'descending' }] };
+      if (dc) b.start_cursor = dc;
+      const r = await httpRequest(`https://api.notion.com/v1/databases/${db.id}/query`, { method: 'POST', headers: h }, JSON.stringify(b));
+      if (r.status !== 200) break;
 
-    while (dbHasMore) {
-      const body = {
-        page_size: 100,
-        sorts: [{ timestamp: 'last_edited_time', direction: 'descending' }],
-      };
-      if (dbCursor) body.start_cursor = dbCursor;
-
-      const res = await httpRequest(
-        `https://api.notion.com/v1/databases/${db.id}/query`,
-        { method: 'POST', headers }, JSON.stringify(body)
-      );
-      if (res.status !== 200) break;
-
-      const results = res.data.results || [];
-      // 30日より古いレコードが出てきたら打ち切り
-      const recent = results.filter(p => p.last_edited_time >= thirtyDaysAgo);
+      const results = r.data.results || [];
+      const recent = results.filter(p => p.last_edited_time >= thirtyAgo);
       for (const p of recent) {
         const props = {};
-        for (const [key, val] of Object.entries(p.properties || {})) {
-          if (val.type === 'title') props[key] = val.title?.map(t => t.plain_text).join('') || '';
-          else if (val.type === 'select') props[key] = val.select?.name || '';
-          else if (val.type === 'status') props[key] = val.status?.name || '';
-          else if (val.type === 'date') props[key] = val.date ? `${val.date.start}${val.date.end ? ' → ' + val.date.end : ''}` : '';
-          else if (val.type === 'rich_text') props[key] = val.rich_text?.map(t => t.plain_text).join('') || '';
-          else if (val.type === 'number') props[key] = val.number;
-          else if (val.type === 'checkbox') props[key] = val.checkbox;
-          else if (val.type === 'multi_select') props[key] = val.multi_select?.map(s => s.name).join(', ') || '';
-          else if (val.type === 'people') props[key] = val.people?.map(pp => pp.name || '').join(', ') || '';
-          else if (val.type === 'url') props[key] = val.url || '';
-          else if (val.type === 'relation') props[key] = `(${val.relation?.length || 0}件)`;
-          else if (val.type === 'formula') props[key] = val.formula?.string || val.formula?.number || '';
+        for (const [k, v] of Object.entries(p.properties || {})) {
+          if (v.type === 'title') props[k] = v.title?.map(t => t.plain_text).join('') || '';
+          else if (v.type === 'select') props[k] = v.select?.name || '';
+          else if (v.type === 'status') props[k] = v.status?.name || '';
+          else if (v.type === 'date') props[k] = v.date?.start || '';
+          else if (v.type === 'rich_text') props[k] = v.rich_text?.map(t => t.plain_text).join('') || '';
+          else if (v.type === 'number') props[k] = v.number;
+          else if (v.type === 'checkbox') props[k] = v.checkbox;
+          else if (v.type === 'multi_select') props[k] = v.multi_select?.map(s => s.name).join(', ') || '';
+          else if (v.type === 'people') props[k] = v.people?.map(p => p.name || '').join(', ') || '';
         }
-        dbRecords.push({ database: dbTitle, id: p.id, lastEdited: p.last_edited_time, properties: props });
+        recs.push({ db: title, lastEdited: p.last_edited_time, props });
       }
-      if (recent.length < results.length) { dbHasMore = false; break; }
-      dbHasMore = res.data.has_more;
-      dbCursor = res.data.next_cursor;
+      if (recent.length < results.length) break;
+      dm = r.data.has_more; dc = r.data.next_cursor;
     }
-
-    allRecords.push(...dbRecords);
-    console.log(`  - DB「${dbTitle}」: ${dbRecords.length}件（30日以内）`);
+    console.log(`  - ${title}: ${recs.filter(r => r.db === title).length}件`);
   }
 
-  // サイズチェック: 大きすぎたら14日に絞る
-  const dataStr = JSON.stringify(allRecords);
-  const estimatedTokens = Math.ceil(dataStr.length / 3);
-  console.log(`  Notion推定トークン: ${estimatedTokens}`);
-
-  let finalRecords = allRecords;
-  if (estimatedTokens > 120000) {
-    finalRecords = allRecords.filter(r => r.lastEdited >= fourteenDaysAgo);
-    console.log(`  ⚠️ データ量過多 → 14日以内に絞り込み: ${finalRecords.length}件`);
+  // 14日フォールバック
+  let final = recs;
+  if (estimateTokens(recs) > TOKEN_LIMIT) {
+    final = recs.filter(r => r.lastEdited >= fourteenAgo);
+    console.log(`  ⚠️ 14日に絞り込み: ${final.length}件`);
   }
 
-  console.log(`✅ Notion: 合計${finalRecords.length}件のレコード`);
-  return {
-    databases: masterDbs.map(d => d.title?.map(t => t.plain_text).join('') || ''),
-    records: finalRecords,
-  };
+  console.log(`✅ Notion: ${final.length}件`);
+  return { databases: masterDbs.map(d => d.title?.map(x => x.plain_text).join('') || ''), records: final };
 }
 
-// --- Slack: 全チャンネル7日間のメッセージ取得 ---
+// --- Slack ---
 async function collectSlack() {
   const auth = { headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` } };
-  const sevenDaysAgo = Math.floor((Date.now() - 7 * 86400000) / 1000);
+  const oldest = String(Math.floor((Date.now() - 7 * 86400000) / 1000));
 
-  // 公開チャンネル一覧
-  console.log('  Slack: チャンネル一覧取得中...');
-  const allChannels = [];
-  let cursor = '';
+  // チャンネル一覧
+  const channels = [];
+  let cur = '';
   do {
-    const params = new URLSearchParams({
-      types: 'public_channel,private_channel',
-      exclude_archived: 'true',
-      limit: '200',
-    });
-    if (cursor) params.set('cursor', cursor);
+    const p = new URLSearchParams({ types: 'public_channel,private_channel', exclude_archived: 'true', limit: '200' });
+    if (cur) p.set('cursor', cur);
+    const r = await httpRequest(`https://slack.com/api/conversations.list?${p}`, auth);
+    if (!r.data.ok) { console.error('  Slack list エラー:', r.data.error); break; }
+    channels.push(...(r.data.channels || []));
+    cur = r.data.response_metadata?.next_cursor || '';
+  } while (cur);
+  console.log(`  Slackチャンネル: ${channels.length}個`);
 
-    const res = await httpRequest(`https://slack.com/api/conversations.list?${params}`, auth);
-    if (!res.data.ok) {
-      console.error('  Slack conversations.list エラー:', res.data.error);
-      break;
+  // Botを各チャンネルにjoin（参加していないと履歴が読めない）
+  for (const ch of channels) {
+    if (!ch.is_member) {
+      await httpRequest('https://slack.com/api/conversations.join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+      }, JSON.stringify({ channel: ch.id }));
+      await sleep(200);
     }
-    allChannels.push(...(res.data.channels || []));
-    cursor = res.data.response_metadata?.next_cursor || '';
-  } while (cursor);
+  }
 
-  console.log(`  ✅ チャンネル: ${allChannels.length}個を発見`);
+  // メッセージ取得
+  const msgs = [];
+  for (const ch of channels) {
+    const p = new URLSearchParams({ channel: ch.id, oldest, limit: '200' });
+    const r = await httpRequest(`https://slack.com/api/conversations.history?${p}`, auth);
+    if (!r.data.ok) continue;
 
-  // 各チャンネルの直近7日間のメッセージを取得
-  // Botが参加しているチャンネルのみ読める。まずBotをjoinさせる必要はないので、読めるものだけ読む
-  const allMessages = [];
-
-  for (const ch of allChannels) {
-    const params = new URLSearchParams({
-      channel: ch.id,
-      oldest: String(sevenDaysAgo),
-      limit: '200',
-    });
-
-    const res = await httpRequest(`https://slack.com/api/conversations.history?${params}`, auth);
-    if (!res.data.ok) {
-      // not_in_channel は無視（Botが参加していないチャンネル）
-      if (res.data.error !== 'not_in_channel') {
-        console.log(`  ⚠️ #${ch.name}: ${res.data.error}`);
-      }
-      continue;
-    }
-
-    const messages = (res.data.messages || [])
-      .filter(m => !m.subtype || m.subtype === 'bot_message') // 通常メッセージとbotメッセージのみ
+    const chMsgs = (r.data.messages || [])
+      .filter(m => m.text && (!m.subtype || m.subtype === 'bot_message'))
       .map(m => ({
-        channel: ch.name,
-        user: m.user || m.username || 'bot',
-        text: truncate(m.text, 500),
-        ts: m.ts,
+        ch: ch.name, user: m.user || 'bot',
+        text: truncate(m.text, 300),
         date: new Date(parseFloat(m.ts) * 1000).toISOString(),
-        replyCount: m.reply_count || 0,
+        replies: m.reply_count || 0,
       }));
-
-    if (messages.length > 0) {
-      allMessages.push(...messages);
-      console.log(`  - #${ch.name}: ${messages.length}件`);
+    if (chMsgs.length > 0) {
+      msgs.push(...chMsgs);
+      console.log(`  - #${ch.name}: ${chMsgs.length}件`);
     }
-
-    // レート制限対策
     await sleep(300);
   }
 
-  console.log(`✅ Slack: ${allMessages.length}件のメッセージを取得`);
-
-  // ユーザーID→名前の解決
-  const userIds = [...new Set(allMessages.map(m => m.user).filter(u => u && u.startsWith('U')))];
-  const userMap = {};
-  for (const uid of userIds) {
-    const res = await httpRequest(`https://slack.com/api/users.info?user=${uid}`, auth);
-    if (res.data.ok) {
-      userMap[uid] = res.data.user.real_name || res.data.user.name;
-    }
+  // ユーザー名解決
+  const uids = [...new Set(msgs.map(m => m.user).filter(u => u?.startsWith('U')))];
+  const umap = {};
+  for (const uid of uids) {
+    const r = await httpRequest(`https://slack.com/api/users.info?user=${uid}`, auth);
+    if (r.data.ok) umap[uid] = r.data.user.real_name || r.data.user.name;
     await sleep(200);
   }
+  for (const m of msgs) { if (umap[m.user]) m.user = umap[m.user]; }
 
-  // ユーザー名を解決
-  for (const msg of allMessages) {
-    if (userMap[msg.user]) msg.userName = userMap[msg.user];
-  }
-
-  return allMessages;
+  console.log(`✅ Slack: ${msgs.length}件`);
+  return msgs;
 }
 
 // ================================================================
-// Claude API
+// 分析ステージ
 // ================================================================
 
-async function callClaude(systemPrompt, userContent, maxTokens = 8000) {
-  const res = await httpRequest('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-  }, JSON.stringify({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: maxTokens,
-    system: systemPrompt,
-    messages: [{ role: 'user', content: userContent }],
-  }));
+const SYS = `あなたは株式会社Mavericks 代表取締役 奥野翔太の専属エグゼクティブアシスタントです。
+データにない推測は禁止。具体的な人名・会社名・日時をそのまま使ってください。`;
 
-  if (res.status !== 200) {
-    console.error('Claude API エラー:', JSON.stringify(res.data).substring(0, 500));
-    throw new Error('Claude API エラー (status ' + res.status + ')');
-  }
-  return res.data.content?.map(c => c.text).join('') || '';
-}
-
-const SYSTEM_BASE = `あなたは株式会社Mavericks 代表取締役 奥野翔太の専属エグゼクティブアシスタントです。
-データにない情報を推測で補わないでください。具体的な人名・会社名・日時をそのまま使ってください。`;
-
-// --- Stage 1: Gmail分析 ---
-async function analyzeGmail(gmailData) {
+async function analyzeGmail(data) {
   console.log('\n=== Stage 1: Gmail分析 ===');
-  const dateStr = jstDate().toISOString().split('T')[0];
+  const d = jstNow().toISOString().split('T')[0];
+  const inst = `今日: ${d}\n自分: ${data.myEmail}\n\n網羅的に分析:\n1. 未読で返信必要な重要メール（全件、差出人・件名・本文要約・推奨アクション）\n2. 返信がないメール（全件、相手・件名・送信日）\n3. 二通目送るべきメール\n4. 期限・締切の言及`;
 
-  // データが大きい場合は分割
-  const fullData = JSON.stringify({ inbox: gmailData.inbox, sent: gmailData.sent, awaitingReply: gmailData.awaitingReply });
-  const tokens = Math.ceil(fullData.length / 3);
-  console.log(`  データ推定トークン: ${tokens}`);
+  const inboxResult = await batchAnalyze(SYS, data.inbox, `${inst}\n\n以下は受信メールです。`, '受信');
+  const sentResult = await batchAnalyze(SYS, data.sent, `${inst}\n\n以下は送信メールです。返信待ち一覧:\n${JSON.stringify(data.awaitingReply, null, 2)}`, '送信');
 
-  if (tokens > 150000) {
-    console.log('  → 分割分析');
-    const inboxResult = await callClaude(SYSTEM_BASE,
-      `今日: ${dateStr}\n自分: ${gmailData.myEmail}\n\n【受信メール（${gmailData.inbox.length}件）】\n${JSON.stringify(gmailData.inbox, null, 2)}\n\n未読・返信必要・期限言及のあるメールを全て特定してください。`);
-    const sentResult = await callClaude(SYSTEM_BASE,
-      `今日: ${dateStr}\n自分: ${gmailData.myEmail}\n\n【送信メール（${gmailData.sent.length}件）】\n${JSON.stringify(gmailData.sent, null, 2)}\n\n【返信待ち（${gmailData.awaitingReply.length}件）】\n${JSON.stringify(gmailData.awaitingReply, null, 2)}\n\nフォローアップすべきメール、二通目送信すべきものを全て特定してください。`);
-    return `【受信分析】\n${inboxResult}\n\n【送信分析】\n${sentResult}`;
-  }
-
-  return await callClaude(SYSTEM_BASE,
-    `今日: ${dateStr}\n自分: ${gmailData.myEmail}\n\n【受信メール（${gmailData.inbox.length}件）】\n${JSON.stringify(gmailData.inbox, null, 2)}\n\n【送信メール（${gmailData.sent.length}件）】\n${JSON.stringify(gmailData.sent, null, 2)}\n\n【返信待ち（${gmailData.awaitingReply.length}件）】\n${JSON.stringify(gmailData.awaitingReply, null, 2)}\n\n以下を網羅的に分析：\n1. 未読で返信必要なメール（全件、差出人・件名・本文要約・推奨アクション）\n2. 返信がないメール（全件、相手・件名・送信日・緊急度）\n3. 二通目を送るべきメール\n4. 重要な進行中スレッド\n5. 期限・締切の言及`);
+  return `【受信メール分析】\n${inboxResult}\n\n【送信メール・返信待ち分析】\n${sentResult}`;
 }
 
-// --- Stage 2: Calendar分析 ---
-async function analyzeCalendar(calendarEvents) {
+async function analyzeCalendar(events) {
   console.log('\n=== Stage 2: Calendar分析 ===');
-  const dateStr = jstDate().toISOString().split('T')[0];
+  const d = jstNow().toISOString().split('T')[0];
+  const inst = `今日: ${d}（日曜日）\n\n日本時間で分析:\n1. 今週の商談・会議の振り返り（全件）\n2. 来週の全予定（日別・時間順、準備事項）\n3. スケジュール重複・問題\n4. 特に準備が必要な予定\n5. 来週の空き時間`;
 
-  return await callClaude(SYSTEM_BASE,
-    `今日: ${dateStr}（日曜日）\n\n【全イベント（${calendarEvents.length}件）】\n${JSON.stringify(calendarEvents, null, 2)}\n\n以下を網羅的に分析（日本時間で）：\n1. 今週実施した商談・会議の振り返り（全件、相手先名・内容）\n2. 来週の全予定（日別・時間順、各予定の準備事項を具体的に）\n3. スケジュールの重複・過密・移動時間問題\n4. 特に準備が必要な重要予定\n5. 来週の空き時間（まとまった作業可能時間）`);
+  return await batchAnalyze(SYS, events, inst, 'Calendar');
 }
 
-// --- Stage 3: Notion分析 ---
-async function analyzeNotion(notionData) {
+async function analyzeNotion(data) {
   console.log('\n=== Stage 3: Notion分析 ===');
+  if (data.records.length === 0) return 'Notion: Master Table DBのデータなし。';
 
-  if (notionData.records.length === 0) {
-    return 'Notion: Master Table DBのデータなし。インテグレーション接続を確認してください。';
-  }
+  const inst = `DB一覧: ${JSON.stringify(data.databases)}\n\n網羅的に分析:\n1. 未完了タスク（全件、期限順）\n2. 商談パイプライン（全商談のステータス・次アクション）\n3. 放置アイテム\n4. 開発タスクの進捗・見落としリスク`;
 
-  const dataStr = JSON.stringify(notionData.records, null, 2);
-  const tokens = Math.ceil(dataStr.length / 3);
-  console.log(`  データ推定トークン: ${tokens}`);
-
-  if (tokens > 150000) {
-    // DB別に分割分析
-    console.log('  → DB別分割分析');
-    const byDb = {};
-    for (const r of notionData.records) {
-      if (!byDb[r.database]) byDb[r.database] = [];
-      byDb[r.database].push(r);
-    }
-
-    const results = [];
-    for (const [dbName, records] of Object.entries(byDb)) {
-      const dbStr = JSON.stringify(records, null, 2);
-      const dbTokens = Math.ceil(dbStr.length / 3);
-      const data = dbTokens > 150000 ? JSON.stringify(records.slice(0, 50), null, 2) : dbStr;
-
-      const result = await callClaude(SYSTEM_BASE,
-        `DB「${dbName}」のレコード（${records.length}件）:\n${data}\n\n未完了タスク、商談状況、放置アイテム、開発タスクの進捗を網羅的に分析してください。`);
-      results.push(`【${dbName}】\n${result}`);
-      console.log(`  ✅ DB「${dbName}」分析完了`);
-    }
-    return results.join('\n\n');
-  }
-
-  return await callClaude(SYSTEM_BASE,
-    `【DB一覧】${JSON.stringify(notionData.databases)}\n\n【レコード（${notionData.records.length}件）】\n${dataStr}\n\n以下を網羅的に分析：\n1. 未完了タスク（全件、期限順、担当者付き）\n2. 商談パイプライン（全商談のステータスと次アクション）\n3. 最近活発なドキュメント\n4. 放置アイテム（更新が止まっているもの全件）\n5. 開発タスクの進捗と見落としリスク`);
+  return await batchAnalyze(SYS, data.records, inst, 'Notion');
 }
 
-// --- Stage 4: Slack分析 ---
-async function analyzeSlack(slackMessages) {
+async function analyzeSlack(messages) {
   console.log('\n=== Stage 4: Slack分析 ===');
+  if (messages.length === 0) return 'Slack: メッセージなし（Botのチャンネル参加を確認）';
 
-  if (slackMessages.length === 0) {
-    return 'Slack: メッセージデータなし。Botがチャンネルに参加しているか確認してください。';
-  }
+  const inst = `直近7日間のSlackメッセージ。網羅的に分析:\n1. 重要な議論・決定事項\n2. 未解決の質問・依頼（全件）\n3. アクションアイテム（誰が何をすべきか全件）\n4. フォローが必要な話題`;
 
-  // チャンネル別にグループ化
-  const byChannel = {};
-  for (const m of slackMessages) {
-    if (!byChannel[m.channel]) byChannel[m.channel] = [];
-    byChannel[m.channel].push(m);
-  }
-
-  const channelSummary = Object.entries(byChannel)
-    .map(([ch, msgs]) => `#${ch}: ${msgs.length}件`)
-    .join(', ');
-  console.log(`  チャンネル別: ${channelSummary}`);
-
-  const dataStr = JSON.stringify(slackMessages, null, 2);
-  const tokens = Math.ceil(dataStr.length / 3);
-  console.log(`  データ推定トークン: ${tokens}`);
-
-  if (tokens > 150000) {
-    // チャンネル別に分割
-    console.log('  → チャンネル別分割分析');
-    const results = [];
-    for (const [ch, msgs] of Object.entries(byChannel)) {
-      const chStr = JSON.stringify(msgs, null, 2);
-      const chTokens = Math.ceil(chStr.length / 3);
-      const data = chTokens > 150000 ? JSON.stringify(msgs.slice(0, 100), null, 2) : chStr;
-
-      const result = await callClaude(SYSTEM_BASE,
-        `Slackチャンネル #${ch} のメッセージ（${msgs.length}件、直近7日間）:\n${data}\n\n重要な議論、決定事項、アクションアイテム、フォローが必要な話題を特定してください。`);
-      results.push(`【#${ch}】\n${result}`);
-    }
-    return results.join('\n\n');
-  }
-
-  return await callClaude(SYSTEM_BASE,
-    `【Slackメッセージ（${slackMessages.length}件、直近7日間）】\nチャンネル: ${channelSummary}\n\n${dataStr}\n\n以下を網羅的に分析：\n1. 重要な議論・決定事項\n2. 未解決の質問・依頼\n3. アクションアイテム（誰が何をすべきか）\n4. フォローが必要な話題\n5. チーム内で共有すべき重要情報`);
+  return await batchAnalyze(SYS, messages, inst, 'Slack');
 }
 
-// --- Stage 5: 統合レビュー ---
-async function synthesizeReview(gmailAnalysis, calendarAnalysis, notionAnalysis, slackAnalysis) {
-  console.log('\n=== Stage 5: 統合レビュー生成 ===');
+// --- 統合 ---
+async function synthesize(gmail, calendar, notion, slack) {
+  console.log('\n=== Stage 5: 統合レビュー ===');
 
-  const system = `あなたは株式会社Mavericks 代表取締役 奥野翔太の専属エグゼクティブアシスタントです。
-各データソースの分析結果を統合し、包括的な週次レビューを作成してください。
+  const sys = `あなたは株式会社Mavericks 代表取締役 奥野翔太の専属エグゼクティブアシスタントです。
 
-最重要ルール：
-- アクションアイテムは網羅的に列挙。可能性があるものは全て出す。漏れは絶対に避ける。
+最重要: アクションアイテムは網羅的に全て列挙。可能性があるものは全て出す。漏れ厳禁。
 - 具体的な人名・会社名・日時を必ず含める。伏字禁止。
-- データにない推測はしない。推測が必要な場合は明示。
-- 営業フォローアップの見落としを積極的にリマインド。
+- データにない推測はしない。
 - Slack記法（*太字*、•箇条書き）を使用。`;
 
-  const userData = `【Gmail分析】\n${gmailAnalysis}\n\n【Calendar分析】\n${calendarAnalysis}\n\n【Notion分析】\n${notionAnalysis}\n\n【Slack分析】\n${slackAnalysis}\n\n上記を統合して週次レビューを作成。
+  // 入力データも大きすぎる場合は要約
+  let input = `【Gmail分析】\n${gmail}\n\n【Calendar分析】\n${calendar}\n\n【Notion分析】\n${notion}\n\n【Slack分析】\n${slack}`;
+
+  if (estimateTokens(input) > TOKEN_LIMIT) {
+    console.log('  統合入力が大きいため、各分析を要約中...');
+    const summarize = async (name, text) => {
+      if (estimateTokens(text) > 30000) {
+        return await callClaude(SYS, `以下の${name}分析結果を、重要なアクションアイテムと事実を保持しつつ、コンパクトに要約してください。\n\n${text}`);
+      }
+      return text;
+    };
+    gmail = await summarize('Gmail', gmail);
+    calendar = await summarize('Calendar', calendar);
+    notion = await summarize('Notion', notion);
+    slack = await summarize('Slack', slack);
+    input = `【Gmail分析】\n${gmail}\n\n【Calendar分析】\n${calendar}\n\n【Notion分析】\n${notion}\n\n【Slack分析】\n${slack}`;
+  }
+
+  const format = `\n\n以下の形式で出力:
 
 *📋 今週の振り返り*
-• 実施した商談・会議を全て列挙（相手先名・内容）
-• Slackでの重要な議論・決定事項
+• 商談・会議を全件列挙（相手先名・内容）
+• Slackの重要議論・決定事項
 • 成果・進展
 
-*📌 来週のアクションアイテム（日別・優先度順）*
-★ ここが最重要セクション。網羅的に全て列挙すること。
-• 月曜〜金曜の各日: 予定＋準備事項＋タスク期限
-• Notionの未完了タスク
-• Slackで発生したアクションアイテム
+*📌 来週のアクションアイテム（日別）*
+★最重要セクション。網羅的に全て列挙。
+• 月〜金の各日: 予定+準備事項+タスク期限
 • メールから発生したアクション
-• 可能性があるものは全てリストアップ
+• Slackから発生したアクション
+• Notionの未完了タスク
+• 可能性があるもの全てリストアップ
 
-*📧 メール対応（重要度順）*
+*📧 メール対応*
 • 未読返信必要（全件）
 • 送信済み未返信（全件、フォローアップ推奨日付き）
-• 二通目送るべき相手
 
 *💬 Slack要対応*
 • 未回答の質問・依頼
-• フォローが必要な議論
 
 *📊 商談パイプライン*
-• 全商談のステータスと次アクション
+• 全商談のステータス・次アクション
 
 *🔧 開発・プロダクト*
 • 進捗と見落としリスク
 
 *⚠️ リスク・注意事項*
-• スケジュール重複・過密
-• 期限切れ案件（全件）
-• 放置案件（全件）
+• スケジュール重複、期限切れ、放置案件（全件）
 
-*💡 提案*
-• 改善ポイント、効率化の提案`;
+*💡 提案*`;
 
-  return await callClaude(system, userData, 12000);
+  return await callClaude(sys, input + format, 12000);
 }
 
-// --- Stage 6: 事実確認 ---
-async function factCheck(review, rawSummary) {
+// --- 事実確認 ---
+async function factCheck(review, summary) {
   console.log('\n=== Stage 6: 事実確認 ===');
-
-  const system = `ファクトチェッカーとして、レビュー内の人名・会社名・日時が元データと一致するか確認。
-問題があれば修正版を出力。問題なければ元のレビューをそのまま出力。`;
-
-  const summary = rawSummary.length > 100000 ? rawSummary.substring(0, 100000) + '\n...(省略)' : rawSummary;
-  return await callClaude(system, `【レビュー】\n${review}\n\n【元データ（照合用）】\n${summary}`, 12000);
+  const s = summary.length > 80000 ? summary.substring(0, 80000) + '...' : summary;
+  return await callClaude(
+    'ファクトチェッカー。レビュー内の人名・日時が元データと一致するか確認。問題あれば修正版を、なければ元のまま出力。',
+    `【レビュー】\n${review}\n\n【元データ】\n${s}`, 12000
+  );
 }
 
 // --- Slack投稿 ---
-async function postToSlack(message) {
-  const MAX = 3900;
+async function post(message) {
   const chunks = [];
-  let remaining = message;
-  while (remaining.length > 0) {
-    if (remaining.length <= MAX) { chunks.push(remaining); break; }
-    let splitAt = remaining.lastIndexOf('\n', MAX);
-    if (splitAt === -1 || splitAt < MAX * 0.5) splitAt = MAX;
-    chunks.push(remaining.substring(0, splitAt));
-    remaining = remaining.substring(splitAt + 1);
+  let rem = message;
+  while (rem.length > 0) {
+    if (rem.length <= 3900) { chunks.push(rem); break; }
+    let s = rem.lastIndexOf('\n', 3900);
+    if (s < 1000) s = 3900;
+    chunks.push(rem.substring(0, s));
+    rem = rem.substring(s + 1);
   }
-
   for (let i = 0; i < chunks.length; i++) {
-    const res = await httpRequest('https://slack.com/api/chat.postMessage', {
+    const r = await httpRequest('https://slack.com/api/chat.postMessage', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json; charset=utf-8', Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
     }, JSON.stringify({ channel: SLACK_CHANNEL_ID, text: chunks[i], unfurl_links: false }));
-    if (!res.data.ok) throw new Error(`Slack投稿エラー: ${JSON.stringify(res.data)}`);
+    if (!r.data.ok) throw new Error(`Slack: ${JSON.stringify(r.data)}`);
     if (i < chunks.length - 1) await sleep(1000);
   }
   console.log(`✅ Slack投稿完了 (${chunks.length}メッセージ)`);
@@ -658,85 +543,61 @@ async function postToSlack(message) {
 // ================================================================
 // メイン
 // ================================================================
-
 async function main() {
-  const startTime = Date.now();
-  console.log('=== 週次レビュー v4 開始 ===');
-  console.log('実行時刻:', new Date().toISOString());
+  const t0 = Date.now();
+  console.log('=== 週次レビュー v4.1 開始 ===');
 
   const required = ['ANTHROPIC_API_KEY', 'NOTION_TOKEN', 'SLACK_BOT_TOKEN', 'SLACK_CHANNEL_ID', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN'];
   const missing = required.filter(k => !process.env[k]);
-  if (missing.length > 0) throw new Error('環境変数が未設定: ' + missing.join(', '));
+  if (missing.length > 0) throw new Error('未設定: ' + missing.join(', '));
 
-  // --- Stage 0: データ収集 ---
-  console.log('\n=== Stage 0: データ収集 ===');
-  const googleToken = await getGoogleAccessToken();
+  // --- 収集 ---
+  console.log('\n=== データ収集 ===');
+  const gtoken = await getGoogleAccessToken();
+  console.log('✅ Google Token取得');
 
-  const [calendarEvents, gmailData, notionData, slackMessages] = await Promise.all([
-    collectCalendar(googleToken),
-    collectGmail(googleToken),
+  const [cal, gmail, notion, slack] = await Promise.all([
+    collectCalendar(gtoken),
+    collectGmail(gtoken),
     collectNotion(),
     collectSlack(),
   ]);
 
-  console.log('\n--- データ収集サマリー ---');
-  console.log(`Calendar: ${calendarEvents.length}件`);
-  console.log(`Gmail: 受信${gmailData.inbox.length}件, 送信${gmailData.sent.length}件, 返信待ち${gmailData.awaitingReply.length}件`);
-  console.log(`Notion: DB${notionData.databases.length}個, レコード${notionData.records.length}件`);
-  console.log(`Slack: ${slackMessages.length}件のメッセージ`);
+  console.log('\n--- サマリー ---');
+  console.log(`Calendar: ${cal.length}件`);
+  console.log(`Gmail: 受信${gmail.inbox.length}, 送信${gmail.sent.length}, 返信待ち${gmail.awaitingReply.length}`);
+  console.log(`Notion: DB${notion.databases.length}個, レコード${notion.records.length}件`);
+  console.log(`Slack: ${slack.length}件`);
 
-  // --- Stage 1-4: 個別分析 ---
-  let gmailAnalysis, calendarAnalysis, notionAnalysis, slackAnalysis;
+  // --- 分析 ---
+  let ga, ca, na, sa;
 
-  try {
-    [gmailAnalysis, calendarAnalysis] = await Promise.all([
-      analyzeGmail(gmailData),
-      analyzeCalendar(calendarEvents),
-    ]);
-  } catch (e) {
-    console.error('Gmail/Calendar分析エラー:', e.message);
-    gmailAnalysis = gmailAnalysis || 'Gmail分析: エラー';
-    calendarAnalysis = calendarAnalysis || 'Calendar分析: エラー';
-  }
+  try { [ga, ca] = await Promise.all([analyzeGmail(gmail), analyzeCalendar(cal)]); }
+  catch (e) { console.error('Gmail/Cal分析エラー:', e.message); ga = ga || 'エラー'; ca = ca || 'エラー'; }
 
-  try {
-    notionAnalysis = await analyzeNotion(notionData);
-  } catch (e) {
-    console.error('Notion分析エラー:', e.message);
-    notionAnalysis = 'Notion分析: エラー（データ量過多の可能性）';
-  }
+  try { na = await analyzeNotion(notion); }
+  catch (e) { console.error('Notion分析エラー:', e.message); na = 'エラー'; }
 
-  try {
-    slackAnalysis = await analyzeSlack(slackMessages);
-  } catch (e) {
-    console.error('Slack分析エラー:', e.message);
-    slackAnalysis = 'Slack分析: エラー';
-  }
+  try { sa = await analyzeSlack(slack); }
+  catch (e) { console.error('Slack分析エラー:', e.message); sa = 'エラー'; }
 
-  console.log('\n各分析完了');
+  // --- 統合 ---
+  let review = await synthesize(ga, ca, na, sa);
 
-  // --- Stage 5: 統合レビュー ---
-  let review = await synthesizeReview(gmailAnalysis, calendarAnalysis, notionAnalysis, slackAnalysis);
-
-  // --- Stage 6: 事実確認 ---
-  const rawSummary = [
-    `Calendar: ${calendarEvents.slice(0, 50).map(e => `${e.start} ${e.title}`).join(', ')}`,
-    `Gmail受信: ${gmailData.inbox.slice(0, 30).map(e => `${e.from}: ${e.subject}`).join(', ')}`,
-    `Gmail送信: ${gmailData.sent.slice(0, 30).map(e => `→${e.to}: ${e.subject}`).join(', ')}`,
-    `Notion DB: ${notionData.databases.join(', ')}`,
-    `Slack: ${slackMessages.slice(0, 50).map(m => `#${m.channel} ${m.userName || m.user}: ${truncate(m.text, 50)}`).join(', ')}`,
+  // --- 事実確認 ---
+  const raw = [
+    `Cal: ${cal.slice(0, 50).map(e => `${e.start} ${e.title}`).join('; ')}`,
+    `Gmail受信: ${gmail.inbox.slice(0, 30).map(e => `${e.from}: ${e.subject}`).join('; ')}`,
+    `Gmail送信: ${gmail.sent.slice(0, 30).map(e => `→${e.to}: ${e.subject}`).join('; ')}`,
+    `Notion: ${notion.databases.join(', ')}`,
+    `Slack: ${slack.slice(0, 30).map(m => `#${m.ch} ${m.user}: ${truncate(m.text, 40)}`).join('; ')}`,
   ].join('\n');
+  review = await factCheck(review, raw);
 
-  review = await factCheck(review, rawSummary);
+  // --- 投稿 ---
+  await post(review);
 
-  // --- Stage 7: Slack投稿 ---
-  await postToSlack(review);
-
-  const elapsed = Math.round((Date.now() - startTime) / 1000);
-  console.log(`\n=== 週次レビュー完了（${elapsed}秒） ===`);
+  console.log(`\n=== 完了（${Math.round((Date.now() - t0) / 1000)}秒） ===`);
 }
 
-main().catch(err => {
-  console.error('❌ エラー:', err.message);
-  process.exit(1);
-});
+main().catch(e => { console.error('❌', e.message); process.exit(1); });
