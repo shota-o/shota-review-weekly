@@ -105,7 +105,10 @@ async function getCalendarEvents(accessToken) {
 
 // --- Gmail: 受信・送信・未返信を総合的にチェック ---
 async function getGmailData(accessToken) {
-  const twoWeeksAgo = Math.floor((Date.now() - 14 * 86400 * 1000) / 1000);
+  // 日付をYYYY/MM/DD形式にする（Gmail検索で確実に動く形式）
+  const d = new Date(Date.now() - 14 * 86400 * 1000);
+  const twoWeeksAgo = `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
+  console.log('Gmail検索期間: after:' + twoWeeksAgo);
 
   // まずGmail APIの疎通テスト
   const profileRes = await httpRequest(
@@ -120,11 +123,13 @@ async function getGmailData(accessToken) {
   console.log(`✅ Gmail: ${profileRes.data.emailAddress} に接続`);
 
   // --- 受信メール（未読・要対応）---
-  const inboxQuery = `in:inbox is:unread after:${twoWeeksAgo}`;
+  const inboxQuery = `in:inbox is:unread newer_than:14d`;
+  console.log('Gmail受信クエリ:', inboxQuery);
   const inboxRes = await httpRequest(
     `https://www.googleapis.com/gmail/v1/users/me/messages?${new URLSearchParams({ q: inboxQuery, maxResults: '20' })}`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
+  console.log('Gmail受信レスポンス status:', inboxRes.status, 'resultSizeEstimate:', inboxRes.data.resultSizeEstimate);
 
   const inboxEmails = [];
   if (inboxRes.status === 200 && inboxRes.data.messages) {
@@ -146,11 +151,13 @@ async function getGmailData(accessToken) {
   console.log(`✅ Gmail受信（未読）: ${inboxEmails.length}件`);
 
   // --- 送信メール ---
-  const sentQuery = `in:sent after:${twoWeeksAgo}`;
+  const sentQuery = `in:sent newer_than:14d`;
+  console.log('Gmail送信クエリ:', sentQuery);
   const sentRes = await httpRequest(
     `https://www.googleapis.com/gmail/v1/users/me/messages?${new URLSearchParams({ q: sentQuery, maxResults: '20' })}`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
+  console.log('Gmail送信レスポンス status:', sentRes.status, 'resultSizeEstimate:', sentRes.data.resultSizeEstimate);
 
   const sentEmails = [];
   if (sentRes.status === 200 && sentRes.data.messages) {
