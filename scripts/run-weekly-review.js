@@ -46,6 +46,17 @@ function estimateTokens(data) {
 }
 function jstNow() { return new Date(Date.now() + 9 * 3600000); }
 
+// 面接関連のメール・イベントを除外するフィルタ
+const INTERVIEW_PATTERNS = [
+  /interview/i, /面接/i, /面談.*選考/i, /選考.*面談/i,
+  /indeed/i, /hiring/i, /recruiter/i, /recruitment/i,
+  /応募/i, /採用.*面/i, /candidate/i, /job\s*application/i,
+];
+function isInterviewRelated(text) {
+  if (!text) return false;
+  return INTERVIEW_PATTERNS.some(p => p.test(text));
+}
+
 // ================================================================
 // Claude API（安全装置付き）
 // ================================================================
@@ -188,19 +199,29 @@ async function collectGmail(accessToken) {
     return all;
   }
 
-  // 受信
+  // 受信（面接関連を除外）
   console.log('  受信メール取得中...');
   const inboxIds = await listAll('in:inbox newer_than:7d');
   const inbox = [];
-  for (const m of inboxIds) { const d = await getMsg(m.id); if (d) inbox.push(d); }
-  console.log(`  ✅ 受信: ${inbox.length}件`);
+  let inboxSkipped = 0;
+  for (const m of inboxIds) {
+    const d = await getMsg(m.id);
+    if (d && !isInterviewRelated(d.subject) && !isInterviewRelated(d.from)) { inbox.push(d); }
+    else if (d) { inboxSkipped++; }
+  }
+  console.log(`  ✅ 受信: ${inbox.length}件（面接除外: ${inboxSkipped}件）`);
 
-  // 送信
+  // 送信（面接関連を除外）
   console.log('  送信メール取得中...');
   const sentIds = await listAll('in:sent newer_than:7d');
   const sent = [];
-  for (const m of sentIds) { const d = await getMsg(m.id); if (d) sent.push(d); }
-  console.log(`  ✅ 送信: ${sent.length}件`);
+  let sentSkipped = 0;
+  for (const m of sentIds) {
+    const d = await getMsg(m.id);
+    if (d && !isInterviewRelated(d.subject) && !isInterviewRelated(d.to)) { sent.push(d); }
+    else if (d) { sentSkipped++; }
+  }
+  console.log(`  ✅ 送信: ${sent.length}件（面接除外: ${sentSkipped}件）`);
 
   // 返信待ち
   console.log('  スレッド分析中...');
@@ -244,16 +265,18 @@ async function collectCalendar(accessToken) {
     );
     if (r.status !== 200) break;
 
-    all.push(...(r.data.items || []).map(e => ({
-      title: e.summary || '(無題)',
-      start: e.start?.dateTime || e.start?.date || '',
-      end: e.end?.dateTime || e.end?.date || '',
-      location: e.location || '',
-      description: truncate(e.description, 200),
-      attendees: (e.attendees || []).filter(a => !a.resource)
-        .map(a => a.displayName || a.email).join(', '),
-      organizer: e.organizer?.displayName || e.organizer?.email || '',
-    })));
+    all.push(...(r.data.items || [])
+      .filter(e => !isInterviewRelated(e.summary) && !isInterviewRelated(e.description))
+      .map(e => ({
+        title: e.summary || '(無題)',
+        start: e.start?.dateTime || e.start?.date || '',
+        end: e.end?.dateTime || e.end?.date || '',
+        location: e.location || '',
+        description: truncate(e.description, 200),
+        attendees: (e.attendees || []).filter(a => !a.resource)
+          .map(a => a.displayName || a.email).join(', '),
+        organizer: e.organizer?.displayName || e.organizer?.email || '',
+      })));
     pt = r.data.nextPageToken;
   } while (pt);
 
@@ -403,7 +426,8 @@ async function collectSlack() {
 // ================================================================
 
 const SYS = `あなたは株式会社Mavericks 代表取締役 奥野翔太の専属エグゼクティブアシスタントです。
-データにない推測は禁止。具体的な人名・会社名・日時をそのまま使ってください。`;
+データにない推測は禁止。具体的な人名・会社名・日時をそのまま使ってください。
+重要：面接・採用選考関連（Indeed、interview、面接、応募、候補者対応など）の情報はすべてスキップし、レビューに含めないこと。`;
 
 async function analyzeGmail(data) {
   console.log('\n=== Stage 1: Gmail分析 ===');
