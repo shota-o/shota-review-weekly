@@ -1,9 +1,13 @@
 {
-  "name": "shota-weekly-review",
-  "version": "3.0.0",
-  "description": "マルチステージ週次レビュー自動化（Gmail + Calendar + Notion → Claude → Slack）",
+  "name": "mavbot",
+  "version": "5.0.0",
+  "description": "週次レビュー + インタラクティブSlack Bot（Gmail + Calendar + Notion + Attio → Claude → Slack）",
   "private": true,
   "scripts": {
-    "review": "node scripts/run-weekly-review.js"
+    "review": "node scripts/run-weekly-review.js",
+    "bot": "node bot/index.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^4.1.0"
   }
 }

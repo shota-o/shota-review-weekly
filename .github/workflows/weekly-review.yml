@@ -18,6 +18,9 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Install dependencies
+        run: npm ci
+
       - name: Run weekly review
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -27,4 +30,4 @@ jobs:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-        run: node scripts/run-weekly-review.js
+        run: npm run review
